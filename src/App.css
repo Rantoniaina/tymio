@@ -1,0 +1,58 @@
+/* Accent palette carried over from the design mockup in design/. */
+:root {
+  --teal: oklch(0.52 0.1 175);
+  --bronze: oklch(0.52 0.1 60);
+  --plum: oklch(0.52 0.1 320);
+  --red: oklch(0.52 0.14 25);
+
+  --bg: oklch(0.98 0.004 80);
+  --fg: oklch(0.25 0.01 80);
+  --muted: oklch(0.58 0.012 80);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: oklch(0.21 0.008 80);
+    --fg: oklch(0.95 0.004 80);
+    --muted: oklch(0.68 0.012 80);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.shell {
+  height: 100%;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 0.25rem;
+}
+
+.shell h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--teal);
+}
+
+.shell p {
+  margin: 0;
+  color: var(--muted);
+}

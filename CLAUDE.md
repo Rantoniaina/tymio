@@ -4,11 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-**There is no code yet.** The repo contains a design reference (`README.md`), a UI mockup (`design/Tymio HR.html`), and nothing else. There is no `package.json`, no `Cargo.toml`, no build system, no tests.
+Scaffold only: a Tauri v2 + React/TS/Vite shell that opens one empty window. No domain code, no database, no migrations, no tests yet. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
 
-Consequence: there are no build/lint/test commands to run. When the scaffold lands, replace this section with the real ones.
+Pinned by the scaffold: Tauri 2.11.5, React 19, Vite 7, TypeScript 5.8, Rust edition 2021. Package manager is **npm** (bun is not installed on this machine).
 
-The planned toolchain is **Tauri v2 + React/TypeScript/Vite + Rust + SQLite (`sqlx`)**, so the commands will be roughly `bun install` / `bun run tauri dev` / `bun run tauri build`, plus `cargo test` in `src-tauri/` for the domain layer and `cargo sqlx migrate run` for schema. Do not assume these work until the scaffold exists.
+## Commands
+
+```sh
+npm install              # once
+npm run tauri dev        # run the app (Vite on :1420 + Rust, hot reload both sides)
+npm run build            # frontend only: tsc && vite build
+npm run tauri build      # packaged installers (needs signing setup, see README)
+
+cd src-tauri && cargo check   # type-check Rust without linking
+cd src-tauri && cargo test    # domain-layer tests (none exist yet)
+cd src-tauri && cargo test payroll::tests::unpaid_leave   # single test by path
+```
+
+Notes that cost time if unknown:
+
+- The **first** `cargo check` or `tauri dev` compiles ~500 crates and takes 4–5 minutes. Incremental builds after that are seconds. Do not assume a hang.
+- `cargo` commands must run from `src-tauri/`, not the repo root.
+- `npm run tauri dev` runs `npm run dev` itself — do not start Vite separately, port 1420 is `strictPort` and will fail.
+- npm 11 blocks the `esbuild` postinstall with an `allow-scripts` warning. It is harmless; the frontend builds fine.
 
 ## What this is
 
