@@ -211,6 +211,11 @@ impl YearMonth {
         self.next().first_day().pred_opt().expect("no month starts at the minimum date")
     }
 
+    /// How many days the month has: 28, 29, 30 or 31.
+    pub fn day_count(self) -> u32 {
+        self.last_day().day()
+    }
+
     pub fn next(self) -> Self {
         if self.month == 12 {
             YearMonth { year: self.year + 1, month: 1 }
@@ -401,6 +406,14 @@ mod tests {
         assert!(YearMonth::parse("2026-13").is_err());
         assert!(YearMonth::parse("2026-00").is_err());
         assert!(YearMonth::parse("september").is_err());
+    }
+
+    #[test]
+    fn year_month_knows_how_many_days_it_has() {
+        assert_eq!(YearMonth::new(2026, 2).expect("february").day_count(), 28);
+        assert_eq!(YearMonth::new(2028, 2).expect("february").day_count(), 29);
+        assert_eq!(YearMonth::new(2026, 9).expect("september").day_count(), 30);
+        assert_eq!(YearMonth::new(2026, 12).expect("december").day_count(), 31);
     }
 
     #[test]

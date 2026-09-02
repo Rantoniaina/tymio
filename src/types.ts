@@ -171,3 +171,50 @@ export interface AuditEntry {
   /** A JSON snapshot of the record after the change (before it, for a delete). */
   detail: string | null;
 }
+
+// ---------------------------------------------------------------- attendance
+
+export type AttendanceSource = "schedule" | "manual";
+
+export interface AttendanceEntry {
+  id: string;
+  employeeId: string;
+  period: YearMonth;
+  /** Half-days: 43 is 21.5 days. */
+  daysWorked: number;
+  /** Whole minutes. */
+  hoursWorked: number;
+  /** Whole minutes. */
+  overtime: number;
+  source: AttendanceSource;
+  createdAt: IsoInstant;
+  updatedAt: IsoInstant;
+}
+
+export interface AttendanceDraft {
+  daysWorkedHalves: number;
+  hoursWorkedMinutes: number;
+  overtimeMinutes: number;
+}
+
+/** `entry` is absent for a month nobody has recorded — not a month of zero. */
+export interface AttendanceRow {
+  employeeId: string;
+  entry: AttendanceEntry | null;
+}
+
+export interface AttendanceTotals {
+  /** Half-days, like `AttendanceEntry.daysWorked`. */
+  daysWorked: number;
+  hoursWorkedMinutes: number;
+  overtimeMinutes: number;
+  recorded: number;
+  missing: number;
+}
+
+export interface AttendanceSheet {
+  projectId: string;
+  period: YearMonth;
+  rows: AttendanceRow[];
+  totals: AttendanceTotals;
+}

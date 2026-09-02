@@ -11,6 +11,11 @@ use chrono::{Local, NaiveDate};
 use tauri::State;
 
 use crate::db::Db;
+use crate::domain::attendance::{
+    AttendanceContext, AttendanceDraft, AttendanceEntry, AttendanceSheet, ValidAttendance,
+    WorkedDays, WorkedTime,
+};
+use crate::domain::calendar::YearMonth;
 use crate::domain::employee::{
     Employee, EmployeeDraft, EmployeeFilter, EmployeeId, EmployeeStats,
 };
@@ -20,9 +25,12 @@ use crate::domain::project::{
 };
 use crate::error::Result;
 use crate::repo::sqlite::{
-    SqliteActivityRepository, SqliteEmployeeRepository, SqliteProjectRepository,
+    SqliteActivityRepository, SqliteAttendanceRepository, SqliteEmployeeRepository,
+    SqliteProjectRepository,
 };
-use crate::repo::{ActivityRepository, AuditEntry, EmployeeRepository, ProjectRepository};
+use crate::repo::{
+    ActivityRepository, AttendanceRepository, AuditEntry, EmployeeRepository, ProjectRepository,
+};
 
 /// How many audit rows the overview's activity list asks for by default.
 pub const DEFAULT_ACTIVITY_LIMIT: u32 = 20;
@@ -33,6 +41,7 @@ pub const DEFAULT_ACTIVITY_LIMIT: u32 = 20;
 pub struct AppState {
     projects: Arc<dyn ProjectRepository>,
     employees: Arc<dyn EmployeeRepository>,
+    attendance: Arc<dyn AttendanceRepository>,
     activity: Arc<dyn ActivityRepository>,
 }
 
@@ -41,6 +50,7 @@ impl AppState {
         AppState {
             projects: Arc::new(SqliteProjectRepository::new(db.clone())),
             employees: Arc::new(SqliteEmployeeRepository::new(db.clone())),
+            attendance: Arc::new(SqliteAttendanceRepository::new(db.clone())),
             activity: Arc::new(SqliteActivityRepository::new(db)),
         }
     }
@@ -146,6 +156,101 @@ impl AppState {
         as_of: Option<NaiveDate>,
     ) -> Result<EmployeeStats> {
         self.employees.stats(&id, as_of.unwrap_or_else(Self::today)).await
+    }
+
+    pub async fn attendance_sheet(
+        &self,
+        project: ProjectId,
+        period: YearMonth,
+    ) -> Result<AttendanceSheet> {
+        self.attendance.sheet(&project, period).await
+    }
+
+    /// Records one employee's month. The hire date has to be read first: it is
+    /// what makes "January, for someone hired in February" an error rather
+    /// than a month with nothing in it.
+    pub async fn record_attendance(
+        &self,
+        employee: EmployeeId,
+        period: YearMonth,
+        draft: AttendanceDraft,
+    ) -> Result<AttendanceEntry> {
+        let person = self.employees.require(&employee).await?;
+        let valid = draft.validate(AttendanceContext::new(period, person.hire_date))?;
+        self.attendance.record(&employee, period, valid).await
+    }
+
+    /// One employee's single month. `None` means nobody has recorded it,
+    /// which is not the same as a month recorded as zero.
+    pub async fn attendance_entry(
+        &self,
+        employee: EmployeeId,
+        period: YearMonth,
+    ) -> Result<Option<AttendanceEntry>> {
+        self.attendance.get(&employee, period).await
+    }
+
+    pub async fn clear_attendance(
+        &self,
+        employee: EmployeeId,
+        period: YearMonth,
+    ) -> Result<Option<AttendanceEntry>> {
+        self.attendance.clear(&employee, period).await
+    }
+
+    /// "Fill from standard schedule": seeds the whole grid from the project's
+    /// work calendar.
+    ///
+    /// Orchestrated here rather than in a repository because it spans three of
+    /// them. The writes go in as one transaction, so a filled grid is never
+    /// half-filled.
+    pub async fn fill_attendance_from_schedule(
+        &self,
+        project: ProjectId,
+        period: YearMonth,
+    ) -> Result<AttendanceSheet> {
+        let stored = self.projects.require(&project).await?;
+        let holidays = self.projects.holiday_set(&project).await?;
+        let employees = self.employees.list(&EmployeeFilter::in_project(&project)).await?;
+
+        let mut seeded = Vec::with_capacity(employees.len());
+        for employee in &employees {
+            // Nothing to seed for a month before somebody was hired — and
+            // recording one would fail validation anyway.
+            if period < YearMonth::of(employee.hire_date) {
+                continue;
+            }
+
+            // Overtime is the one number the calendar cannot know, so an
+            // existing value survives the refill.
+            let overtime = self
+                .attendance
+                .get(&employee.id, period)
+                .await?
+                .map(|entry| entry.overtime)
+                .unwrap_or(WorkedTime::ZERO);
+
+            seeded.push((
+                employee.id.clone(),
+                ValidAttendance::from_standard_schedule(
+                    &stored.calendar,
+                    &holidays,
+                    period,
+                    employee.hire_date,
+                    // Approved leave belongs here. The leave slice fills it in;
+                    // until then nothing is deducted.
+                    WorkedDays::ZERO,
+                    overtime,
+                ),
+            ));
+        }
+
+        self.attendance.record_many(period, seeded).await?;
+        self.attendance.sheet(&project, period).await
+    }
+
+    pub async fn employee_attendance(&self, employee: EmployeeId) -> Result<Vec<AttendanceEntry>> {
+        self.attendance.history(&employee).await
     }
 }
 
@@ -269,6 +374,60 @@ pub async fn employee_stats(
     as_of: Option<NaiveDate>,
 ) -> Result<EmployeeStats> {
     state.employee_stats(id, as_of).await
+}
+
+#[tauri::command]
+pub async fn attendance_sheet(
+    state: State<'_, AppState>,
+    project: ProjectId,
+    period: YearMonth,
+) -> Result<AttendanceSheet> {
+    state.attendance_sheet(project, period).await
+}
+
+#[tauri::command]
+pub async fn record_attendance(
+    state: State<'_, AppState>,
+    employee: EmployeeId,
+    period: YearMonth,
+    draft: AttendanceDraft,
+) -> Result<AttendanceEntry> {
+    state.record_attendance(employee, period, draft).await
+}
+
+#[tauri::command]
+pub async fn attendance_entry(
+    state: State<'_, AppState>,
+    employee: EmployeeId,
+    period: YearMonth,
+) -> Result<Option<AttendanceEntry>> {
+    state.attendance_entry(employee, period).await
+}
+
+#[tauri::command]
+pub async fn clear_attendance(
+    state: State<'_, AppState>,
+    employee: EmployeeId,
+    period: YearMonth,
+) -> Result<Option<AttendanceEntry>> {
+    state.clear_attendance(employee, period).await
+}
+
+#[tauri::command]
+pub async fn fill_attendance_from_schedule(
+    state: State<'_, AppState>,
+    project: ProjectId,
+    period: YearMonth,
+) -> Result<AttendanceSheet> {
+    state.fill_attendance_from_schedule(project, period).await
+}
+
+#[tauri::command]
+pub async fn employee_attendance(
+    state: State<'_, AppState>,
+    employee: EmployeeId,
+) -> Result<Vec<AttendanceEntry>> {
+    state.employee_attendance(employee).await
 }
 
 #[cfg(test)]
@@ -551,6 +710,316 @@ mod tests {
 
             assert!(state.list_employees(None).await.expect("query runs").is_empty());
             assert_eq!(state.portfolio_stats().await.expect("query runs").people, 0);
+        }
+    }
+
+    mod attendance {
+        use super::*;
+
+        use crate::domain::attendance::{AttendanceSource, WorkedDays, WorkedTime};
+        use crate::domain::calendar::{DayLength, WeekdayMask};
+        use crate::domain::employee::EmployeeDraft;
+
+        fn september() -> YearMonth {
+            YearMonth::new(2026, 9).expect("september")
+        }
+
+        /// A project with a Mon–Fri, eight-hour calendar and two long-serving
+        /// employees.
+        async fn staffed() -> (AppState, ProjectId, Vec<Employee>) {
+            let state = state().await;
+            let project = state
+                .create_project(ProjectDraft::new("Ambatolampy Solar Farm", date("2020-01-01")))
+                .await
+                .expect("stored");
+
+            let mut people = Vec::new();
+            for (first, last) in [("Rakoto", "Randrianasolo"), ("Fara", "Rasoanaivo")] {
+                people.push(
+                    state
+                        .create_employee(
+                            project.id.clone(),
+                            EmployeeDraft::new(first, last, "Operative", date("2020-01-06")),
+                        )
+                        .await
+                        .expect("hired"),
+                );
+            }
+            (state, project.id, people)
+        }
+
+        #[tokio::test]
+        async fn an_invalid_row_never_reaches_storage() {
+            let (state, project, people) = staffed().await;
+
+            let error = state
+                .record_attendance(people[0].id.clone(), september(), AttendanceDraft::of_days(31, 480))
+                .await
+                .expect_err("September has 30 days");
+
+            match error {
+                AppError::Validation(errors) => assert!(errors.has("daysWorked")),
+                other => panic!("expected validation, got {other:?}"),
+            }
+
+            let sheet = state.attendance_sheet(project, september()).await.expect("query runs");
+            assert_eq!(sheet.totals.recorded, 0);
+        }
+
+        #[tokio::test]
+        async fn a_month_before_the_hire_date_is_rejected_with_the_hire_month_named() {
+            let state = state().await;
+            let project = state
+                .create_project(ProjectDraft::new("Ambatolampy Solar Farm", date("2026-01-01")))
+                .await
+                .expect("stored");
+            let late = state
+                .create_employee(
+                    project.id,
+                    EmployeeDraft::new("Hery", "Rabemananjara", "Crane operator", date("2026-04-01")),
+                )
+                .await
+                .expect("hired");
+
+            let error = state
+                .record_attendance(
+                    late.id,
+                    YearMonth::new(2026, 3).expect("march"),
+                    AttendanceDraft::of_days(20, 480),
+                )
+                .await
+                .expect_err("hired in April, recorded in March");
+
+            match error {
+                AppError::Validation(errors) => assert!(errors.has("period")),
+                other => panic!("expected validation, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn recording_against_somebody_who_does_not_exist_is_a_not_found() {
+            let (state, _, _) = staffed().await;
+            let result = state
+                .record_attendance(
+                    EmployeeId::from("ghost"),
+                    september(),
+                    AttendanceDraft::of_days(20, 480),
+                )
+                .await;
+
+            assert!(matches!(result, Err(AppError::NotFound { entity: "employee", .. })));
+        }
+
+        #[tokio::test]
+        async fn filling_from_the_schedule_seeds_the_whole_grid() {
+            let (state, project, _) = staffed().await;
+
+            let sheet = state
+                .fill_attendance_from_schedule(project, september())
+                .await
+                .expect("fill runs");
+
+            assert_eq!(sheet.totals.recorded, 2);
+            assert_eq!(sheet.totals.missing, 0);
+            // September 2026 has 22 weekdays; two people at 8 hours a day.
+            assert_eq!(sheet.total_days(), WorkedDays::from_days(44));
+            assert_eq!(sheet.totals.hours_worked_minutes, 2 * 176 * 60);
+            assert!(sheet
+                .rows
+                .iter()
+                .all(|row| row.entry.as_ref().expect("recorded").source
+                    == AttendanceSource::Schedule));
+        }
+
+        #[tokio::test]
+        async fn filling_follows_the_projects_own_calendar_and_holidays() {
+            let state = state().await;
+            let mut draft = ProjectDraft::new("Toamasina Port Logistics", date("2020-01-01"));
+            draft.working_days = WeekdayMask::MON_SAT;
+            draft.day_length = DayLength::from_hours_and_minutes(7, 30).expect("7h30");
+            let project = state.create_project(draft).await.expect("stored");
+
+            state
+                .add_project_holiday(
+                    project.id.clone(),
+                    HolidayDraft::new(date("2026-09-07"), "Site shutdown"),
+                )
+                .await
+                .expect("holiday added");
+            state
+                .create_employee(
+                    project.id.clone(),
+                    EmployeeDraft::new("Mamy", "Andrianina", "Forklift driver", date("2020-01-06")),
+                )
+                .await
+                .expect("hired");
+
+            let sheet = state
+                .fill_attendance_from_schedule(project.id, september())
+                .await
+                .expect("fill runs");
+
+            // 26 Mon–Sat days less one holiday, at 7h30.
+            assert_eq!(sheet.total_days(), WorkedDays::from_days(25));
+            assert_eq!(sheet.totals.hours_worked_minutes, 25 * 450);
+        }
+
+        #[tokio::test]
+        async fn filling_clips_to_the_part_of_the_month_somebody_was_employed_for() {
+            let (state, project, _) = staffed().await;
+            state
+                .create_employee(
+                    project.clone(),
+                    // Tuesday; 15–30 September has 12 weekdays.
+                    EmployeeDraft::new("Nivo", "Rajaonarison", "Carpenter", date("2026-09-15")),
+                )
+                .await
+                .expect("hired");
+
+            let sheet = state
+                .fill_attendance_from_schedule(project, september())
+                .await
+                .expect("fill runs");
+
+            assert_eq!(sheet.totals.recorded, 3);
+            assert_eq!(sheet.total_days(), WorkedDays::from_days(22 + 22 + 12));
+        }
+
+        #[tokio::test]
+        async fn filling_skips_anyone_not_yet_hired_that_month() {
+            let (state, project, _) = staffed().await;
+            state
+                .create_employee(
+                    project.clone(),
+                    EmployeeDraft::new("Vola", "Rasoamanana", "Customs clerk", date("2026-11-02")),
+                )
+                .await
+                .expect("hired");
+
+            let sheet = state
+                .fill_attendance_from_schedule(project, september())
+                .await
+                .expect("fill runs");
+
+            assert_eq!(sheet.totals.recorded, 2, "the November hire has no September");
+            assert_eq!(sheet.totals.missing, 1);
+        }
+
+        #[tokio::test]
+        async fn filling_twice_is_the_same_as_filling_once() {
+            let (state, project, _) = staffed().await;
+
+            let first = state
+                .fill_attendance_from_schedule(project.clone(), september())
+                .await
+                .expect("fill runs");
+            let second = state
+                .fill_attendance_from_schedule(project, september())
+                .await
+                .expect("fill runs again");
+
+            assert_eq!(first.totals, second.totals);
+            assert_eq!(first.rows.len(), second.rows.len());
+        }
+
+        #[tokio::test]
+        async fn refilling_keeps_the_overtime_a_person_typed_in() {
+            let (state, project, people) = staffed().await;
+
+            // 22 days, 176 hours, plus 9 hours of overtime nobody's calendar
+            // could have known about.
+            state
+                .record_attendance(
+                    people[0].id.clone(),
+                    september(),
+                    AttendanceDraft::new(44, 176 * 60, 9 * 60),
+                )
+                .await
+                .expect("recorded");
+
+            state
+                .fill_attendance_from_schedule(project, september())
+                .await
+                .expect("fill runs");
+
+            let refilled = state
+                .attendance_entry(people[0].id.clone(), september())
+                .await
+                .expect("query runs")
+                .expect("recorded");
+            assert_eq!(refilled.overtime, WorkedTime::from_hours(9), "overtime survives a refill");
+            assert_eq!(refilled.days_worked, WorkedDays::from_days(22));
+            assert_eq!(refilled.source, AttendanceSource::Schedule);
+        }
+
+        #[tokio::test]
+        async fn a_manual_edit_after_a_fill_wins_and_says_so() {
+            let (state, project, people) = staffed().await;
+            state
+                .fill_attendance_from_schedule(project, september())
+                .await
+                .expect("fill runs");
+
+            let edited = state
+                .record_attendance(
+                    people[0].id.clone(),
+                    september(),
+                    AttendanceDraft::new(40, 160 * 60, 0),
+                )
+                .await
+                .expect("recorded");
+
+            assert_eq!(edited.days_worked, WorkedDays::from_days(20));
+            assert_eq!(edited.source, AttendanceSource::Manual);
+        }
+
+        #[tokio::test]
+        async fn clearing_a_month_leaves_it_blank_rather_than_zero() {
+            let (state, project, people) = staffed().await;
+            state
+                .fill_attendance_from_schedule(project.clone(), september())
+                .await
+                .expect("fill runs");
+
+            state
+                .clear_attendance(people[0].id.clone(), september())
+                .await
+                .expect("clear runs")
+                .expect("there was something to clear");
+
+            let sheet = state.attendance_sheet(project, september()).await.expect("query runs");
+            assert_eq!(sheet.totals.recorded, 1);
+            assert_eq!(sheet.totals.missing, 1);
+        }
+
+        #[tokio::test]
+        async fn one_persons_history_comes_back_newest_month_first() {
+            let (state, _, people) = staffed().await;
+            for month in [7, 8, 9] {
+                state
+                    .record_attendance(
+                        people[0].id.clone(),
+                        YearMonth::new(2026, month).expect("valid month"),
+                        AttendanceDraft::of_days(20, 480),
+                    )
+                    .await
+                    .expect("recorded");
+            }
+
+            let history =
+                state.employee_attendance(people[0].id.clone()).await.expect("query runs");
+            let months: Vec<u32> = history.iter().map(|entry| entry.period.month).collect();
+            assert_eq!(months, [9, 8, 7]);
+        }
+
+        #[tokio::test]
+        async fn filling_a_project_that_is_gone_is_a_not_found() {
+            let (state, _, _) = staffed().await;
+            let result = state
+                .fill_attendance_from_schedule(ProjectId::from("ghost"), september())
+                .await;
+
+            assert!(matches!(result, Err(AppError::NotFound { entity: "project", .. })));
         }
     }
 }

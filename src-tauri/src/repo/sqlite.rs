@@ -16,17 +16,29 @@ use crate::domain::project::{
     Holiday, HolidayId, PortfolioStats, Project, ProjectFilter, ProjectId, ProjectStats,
     ProjectStatus, ValidHoliday, ValidProject,
 };
-use crate::domain::calendar::{DayLength, WeekdayMask, WorkCalendar};
+use crate::domain::attendance::{
+    AttendanceEntry, AttendanceId, AttendanceRow, AttendanceSheet, AttendanceSource, ValidAttendance,
+    WorkedDays, WorkedTime,
+};
+use crate::domain::calendar::{DayLength, WeekdayMask, WorkCalendar, YearMonth};
 use crate::domain::employee::{
     Employee, EmployeeFilter, EmployeeId, EmployeeStats, ValidEmployee,
 };
 use crate::error::{AppError, Result};
 
-use super::{ActivityRepository, AuditAction, AuditEntry, EmployeeRepository, ProjectRepository};
+use super::{
+    ActivityRepository, AttendanceRepository, AuditAction, AuditEntry, EmployeeRepository,
+    ProjectRepository,
+};
 
 const PROJECT_ENTITY: &str = "project";
 const HOLIDAY_ENTITY: &str = "project_holiday";
 const EMPLOYEE_ENTITY: &str = "employee";
+const ATTENDANCE_ENTITY: &str = "attendance";
+
+const ATTENDANCE_COLUMNS: &str = "id, employee_id, period, days_worked_halves, \
+                                  hours_worked_minutes, overtime_minutes, source, \
+                                  created_at, updated_at";
 
 const PROJECT_COLUMNS: &str = "id, name, client, location, status, start_date, end_date, \
                                working_days_mask, hours_per_day_minutes, created_at, updated_at";
@@ -68,6 +80,11 @@ repository! {
 repository! {
     /// The people on those projects.
     SqliteEmployeeRepository
+}
+
+repository! {
+    /// Days, hours and overtime, per employee per month.
+    SqliteAttendanceRepository
 }
 
 repository! {
@@ -163,6 +180,37 @@ fn employee_from_row(row: &SqliteRow) -> Result<Employee> {
         hire_date: row.try_get("hire_date")?,
         bank_account: row.try_get("bank_account")?,
         emergency_contact: row.try_get("emergency_contact")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn attendance_from_row(row: &SqliteRow) -> Result<AttendanceEntry> {
+    let id: String = row.try_get("id")?;
+    let corrupt = |detail: String| AppError::CorruptRow {
+        entity: ATTENDANCE_ENTITY,
+        id: id.clone(),
+        detail,
+    };
+
+    let period: String = row.try_get("period")?;
+    let period = YearMonth::parse(&period).map_err(|e| corrupt(e.to_string()))?;
+
+    let source: String = row.try_get("source")?;
+    let source: AttendanceSource = source.parse().map_err(|e: crate::domain::attendance::AttendanceError| corrupt(e.to_string()))?;
+
+    let days: i64 = row.try_get("days_worked_halves")?;
+    let hours: i64 = row.try_get("hours_worked_minutes")?;
+    let overtime: i64 = row.try_get("overtime_minutes")?;
+
+    Ok(AttendanceEntry {
+        id: AttendanceId::from(id.clone()),
+        employee_id: EmployeeId::from(row.try_get::<String, _>("employee_id")?),
+        period,
+        days_worked: WorkedDays::from_halves(days).map_err(|e| corrupt(e.to_string()))?,
+        hours_worked: WorkedTime::from_minutes(hours).map_err(|e| corrupt(e.to_string()))?,
+        overtime: WorkedTime::from_minutes(overtime).map_err(|e| corrupt(e.to_string()))?,
+        source,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -680,6 +728,209 @@ impl EmployeeRepository for SqliteEmployeeRepository {
 
     async fn stats(&self, id: &EmployeeId, as_of: NaiveDate) -> Result<EmployeeStats> {
         Ok(self.require(id).await?.service_at(as_of))
+    }
+}
+
+/// The upsert behind `record` and `record_many`.
+///
+/// One statement rather than a read-then-write, so two saves of the same month
+/// cannot interleave into a duplicate row — the `(employee_id, period)` unique
+/// index is what makes it a replace.
+async fn upsert(
+    conn: &mut SqliteConnection,
+    employee: &EmployeeId,
+    period: YearMonth,
+    entry: ValidAttendance,
+    now: DateTime<Utc>,
+) -> Result<AttendanceEntry> {
+    let row = sqlx::query(&format!(
+        "INSERT INTO attendance (id, employee_id, period, days_worked_halves, \
+         hours_worked_minutes, overtime_minutes, source, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8) \
+         ON CONFLICT (employee_id, period) DO UPDATE SET \
+           days_worked_halves = excluded.days_worked_halves, \
+           hours_worked_minutes = excluded.hours_worked_minutes, \
+           overtime_minutes = excluded.overtime_minutes, \
+           source = excluded.source, \
+           updated_at = excluded.updated_at \
+         RETURNING {ATTENDANCE_COLUMNS}"
+    ))
+    .bind(AttendanceId::new().as_str())
+    .bind(employee.as_str())
+    .bind(period.to_string())
+    .bind(i64::from(entry.days_worked().halves()))
+    .bind(i64::from(entry.hours_worked().minutes()))
+    .bind(i64::from(entry.overtime().minutes()))
+    .bind(entry.source().as_str())
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| match &e {
+        // The only foreign key on this table is the employee.
+        sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
+            AppError::not_found(EMPLOYEE_ENTITY, employee)
+        }
+        _ => AppError::Database(e),
+    })?;
+
+    attendance_from_row(&row)
+}
+
+#[async_trait]
+impl AttendanceRepository for SqliteAttendanceRepository {
+    async fn get(
+        &self,
+        employee: &EmployeeId,
+        period: YearMonth,
+    ) -> Result<Option<AttendanceEntry>> {
+        let row = sqlx::query(&format!(
+            "SELECT {ATTENDANCE_COLUMNS} FROM attendance WHERE employee_id = ?1 AND period = ?2"
+        ))
+        .bind(employee.as_str())
+        .bind(period.to_string())
+        .fetch_optional(self.db.pool())
+        .await?;
+
+        row.as_ref().map(attendance_from_row).transpose()
+    }
+
+    async fn record(
+        &self,
+        employee: &EmployeeId,
+        period: YearMonth,
+        entry: ValidAttendance,
+    ) -> Result<AttendanceEntry> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let stored = upsert(&mut tx, employee, period, entry, now).await?;
+        // Create or update: whether this month already existed is the
+        // difference, and `created_at` is how the row itself says so.
+        let action = if stored.created_at == stored.updated_at {
+            AuditAction::Create
+        } else {
+            AuditAction::Update
+        };
+        record(&mut tx, now, ATTENDANCE_ENTITY, stored.id.as_str(), action, snapshot(&stored))
+            .await?;
+
+        tx.commit().await?;
+        Ok(stored)
+    }
+
+    async fn record_many(
+        &self,
+        period: YearMonth,
+        entries: Vec<(EmployeeId, ValidAttendance)>,
+    ) -> Result<u32> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let mut written = 0;
+        for (employee, entry) in entries {
+            let stored = upsert(&mut tx, &employee, period, entry, now).await?;
+            let action = if stored.created_at == stored.updated_at {
+                AuditAction::Create
+            } else {
+                AuditAction::Update
+            };
+            record(&mut tx, now, ATTENDANCE_ENTITY, stored.id.as_str(), action, snapshot(&stored))
+                .await?;
+            written += 1;
+        }
+
+        tx.commit().await?;
+        Ok(written)
+    }
+
+    async fn clear(
+        &self,
+        employee: &EmployeeId,
+        period: YearMonth,
+    ) -> Result<Option<AttendanceEntry>> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let row = sqlx::query(&format!(
+            "DELETE FROM attendance WHERE employee_id = ?1 AND period = ?2 \
+             RETURNING {ATTENDANCE_COLUMNS}"
+        ))
+        .bind(employee.as_str())
+        .bind(period.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            // Nothing to clear is not a failure; a blank month is a state.
+            return Ok(None);
+        };
+        let cleared = attendance_from_row(&row)?;
+
+        record(
+            &mut tx,
+            now,
+            ATTENDANCE_ENTITY,
+            cleared.id.as_str(),
+            AuditAction::Delete,
+            snapshot(&cleared),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(cleared))
+    }
+
+    async fn sheet(&self, project: &ProjectId, period: YearMonth) -> Result<AttendanceSheet> {
+        // A LEFT JOIN so that everyone on the project gets a line, including
+        // the ones nobody has recorded yet. Ordered the way the employees
+        // screen orders them.
+        let rows = sqlx::query(
+            "SELECT e.id AS employee_id, e.last_name, e.first_name, \
+                    a.id AS id, a.period AS period, a.days_worked_halves, \
+                    a.hours_worked_minutes, a.overtime_minutes, a.source, \
+                    a.created_at, a.updated_at \
+             FROM employees e \
+             LEFT JOIN attendance a ON a.employee_id = e.id AND a.period = ?2 \
+             WHERE e.project_id = ?1",
+        )
+        .bind(project.as_str())
+        .bind(period.to_string())
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let mut lines: Vec<(String, String, AttendanceRow)> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let employee_id = EmployeeId::from(row.try_get::<String, _>("employee_id")?);
+            let recorded: Option<String> = row.try_get("id")?;
+            let entry = match recorded {
+                Some(_) => Some(attendance_from_row(row)?),
+                None => None,
+            };
+            lines.push((
+                row.try_get::<String, _>("last_name")?.to_lowercase(),
+                row.try_get::<String, _>("first_name")?.to_lowercase(),
+                AttendanceRow { employee_id, entry },
+            ));
+        }
+        lines.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+
+        Ok(AttendanceSheet::new(
+            project.clone(),
+            period,
+            lines.into_iter().map(|(_, _, row)| row).collect(),
+        ))
+    }
+
+    async fn history(&self, employee: &EmployeeId) -> Result<Vec<AttendanceEntry>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ATTENDANCE_COLUMNS} FROM attendance WHERE employee_id = ?1 \
+             ORDER BY period DESC"
+        ))
+        .bind(employee.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+
+        rows.iter().map(attendance_from_row).collect()
     }
 }
 
@@ -1655,6 +1906,363 @@ mod tests {
             let (projects, _, _, project) = on_a_project().await;
             let stats = projects.stats(&project.id, date("2026-09-15")).await.expect("query runs");
             assert_eq!(stats.headcount, 0);
+        }
+    }
+
+    mod attendance {
+        use super::*;
+
+        use crate::domain::attendance::{
+            AttendanceContext, AttendanceDraft, AttendanceSource, WorkedDays, WorkedTime,
+        };
+        use crate::domain::calendar::YearMonth;
+        use crate::domain::employee::EmployeeDraft;
+
+        fn september() -> YearMonth {
+            YearMonth::new(2026, 9).expect("september")
+        }
+
+        /// A validated row for someone hired long ago, so only the numbers
+        /// under test can fail.
+        fn row(days_halves: i64, minutes: i64, overtime: i64) -> ValidAttendance {
+            AttendanceDraft::new(days_halves, minutes, overtime)
+                .validate(AttendanceContext::new(september(), date("2020-01-06")))
+                .expect("valid row")
+        }
+
+        async fn staffed() -> (
+            SqliteProjectRepository,
+            SqliteEmployeeRepository,
+            SqliteAttendanceRepository,
+            SqliteActivityRepository,
+            Project,
+            Vec<Employee>,
+        ) {
+            let db = Db::in_memory().await.expect("in-memory database opens");
+            let projects = SqliteProjectRepository::new(db.clone());
+            let employees = SqliteEmployeeRepository::new(db.clone());
+            let attendance = SqliteAttendanceRepository::new(db.clone());
+            let log = SqliteActivityRepository::new(db);
+
+            let project = projects.create(valid(solar_farm())).await.expect("stored");
+            let mut hired = Vec::new();
+            for (first, last, role) in [
+                ("Rakoto", "Randrianasolo", "Site supervisor"),
+                ("Fara", "Rasoanaivo", "HSE officer"),
+                ("Naivo", "Razafimahatratra", "Electrician"),
+            ] {
+                hired.push(
+                    employees
+                        .create(
+                            &project.id,
+                            EmployeeDraft::new(first, last, role, date("2020-01-06"))
+                                .validate()
+                                .expect("valid"),
+                        )
+                        .await
+                        .expect("hired"),
+                );
+            }
+
+            (projects, employees, attendance, log, project, hired)
+        }
+
+        #[tokio::test]
+        async fn a_recorded_month_reads_back_identically() {
+            let (_, _, attendance, _, _, people) = staffed().await;
+
+            let stored = attendance
+                .record(&people[0].id, september(), row(44, 176 * 60, 3 * 60))
+                .await
+                .expect("recorded");
+
+            let fetched = attendance
+                .get(&people[0].id, september())
+                .await
+                .expect("query runs")
+                .expect("it is there");
+            assert_eq!(fetched, stored);
+            assert_eq!(fetched.period, september());
+            assert_eq!(fetched.days_worked, WorkedDays::from_days(22));
+            assert_eq!(fetched.hours_worked, WorkedTime::from_hours(176));
+            assert_eq!(fetched.overtime, WorkedTime::from_hours(3));
+            assert_eq!(fetched.source, AttendanceSource::Manual);
+        }
+
+        #[tokio::test]
+        async fn half_days_survive_the_round_trip() {
+            let (_, _, attendance, _, _, people) = staffed().await;
+            attendance
+                .record(&people[0].id, september(), row(43, 172 * 60, 0))
+                .await
+                .expect("recorded");
+
+            let fetched = attendance
+                .get(&people[0].id, september())
+                .await
+                .expect("query runs")
+                .expect("it is there");
+            assert_eq!(fetched.days_worked.to_string(), "21.5");
+        }
+
+        #[tokio::test]
+        async fn an_unrecorded_month_is_none_not_a_zero_row() {
+            let (_, _, attendance, _, _, people) = staffed().await;
+            assert_eq!(
+                attendance.get(&people[0].id, september()).await.expect("query runs"),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn recording_a_month_twice_replaces_it_rather_than_duplicating() {
+            let (_, _, attendance, _, _, people) = staffed().await;
+
+            let first = attendance
+                .record(&people[0].id, september(), row(44, 176 * 60, 0))
+                .await
+                .expect("recorded");
+            let second = attendance
+                .record(&people[0].id, september(), row(40, 160 * 60, 2 * 60))
+                .await
+                .expect("recorded again");
+
+            assert_eq!(second.id, first.id, "the same month is the same row");
+            assert_eq!(second.created_at, first.created_at);
+            assert!(second.updated_at >= first.updated_at);
+            assert_eq!(second.days_worked, WorkedDays::from_days(20));
+
+            assert_eq!(attendance.history(&people[0].id).await.expect("query runs").len(), 1);
+        }
+
+        #[tokio::test]
+        async fn one_month_does_not_disturb_another() {
+            let (_, _, attendance, _, _, people) = staffed().await;
+            let august = YearMonth::new(2026, 8).expect("august");
+
+            attendance
+                .record(&people[0].id, september(), row(44, 176 * 60, 0))
+                .await
+                .expect("recorded");
+            attendance
+                .record(
+                    &people[0].id,
+                    august,
+                    AttendanceDraft::new(42, 168 * 60, 0)
+                        .validate(AttendanceContext::new(august, date("2020-01-06")))
+                        .expect("valid"),
+                )
+                .await
+                .expect("recorded");
+
+            let history = attendance.history(&people[0].id).await.expect("query runs");
+            assert_eq!(history.len(), 2);
+            // Most recent month first.
+            assert_eq!(history[0].period, september());
+            assert_eq!(history[1].period, august);
+        }
+
+        #[tokio::test]
+        async fn two_people_keep_their_own_months() {
+            let (_, _, attendance, _, _, people) = staffed().await;
+
+            attendance
+                .record(&people[0].id, september(), row(44, 176 * 60, 0))
+                .await
+                .expect("recorded");
+            attendance
+                .record(&people[1].id, september(), row(40, 160 * 60, 0))
+                .await
+                .expect("recorded");
+
+            assert_eq!(
+                attendance
+                    .get(&people[1].id, september())
+                    .await
+                    .expect("query runs")
+                    .expect("there")
+                    .days_worked,
+                WorkedDays::from_days(20)
+            );
+        }
+
+        #[tokio::test]
+        async fn attendance_cannot_be_recorded_against_somebody_who_does_not_exist() {
+            let (_, _, attendance, _, _, _) = staffed().await;
+            let result = attendance
+                .record(&EmployeeId::from("ghost"), september(), row(44, 176 * 60, 0))
+                .await;
+
+            assert!(matches!(result, Err(AppError::NotFound { entity: "employee", .. })));
+        }
+
+        #[tokio::test]
+        async fn clearing_returns_what_was_removed_and_clearing_nothing_is_not_an_error() {
+            let (_, _, attendance, _, _, people) = staffed().await;
+            let stored = attendance
+                .record(&people[0].id, september(), row(44, 176 * 60, 0))
+                .await
+                .expect("recorded");
+
+            assert_eq!(
+                attendance.clear(&people[0].id, september()).await.expect("clear runs"),
+                Some(stored)
+            );
+            assert_eq!(
+                attendance.get(&people[0].id, september()).await.expect("query runs"),
+                None
+            );
+            // A blank month is a legitimate state, not a failure.
+            assert_eq!(
+                attendance.clear(&people[0].id, september()).await.expect("clear runs"),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn a_bulk_write_lands_as_one_transaction() {
+            let (_, _, attendance, _, _, people) = staffed().await;
+
+            let written = attendance
+                .record_many(
+                    september(),
+                    people.iter().map(|p| (p.id.clone(), row(44, 176 * 60, 0))).collect(),
+                )
+                .await
+                .expect("bulk write runs");
+
+            assert_eq!(written, 3);
+            for person in &people {
+                assert!(attendance
+                    .get(&person.id, september())
+                    .await
+                    .expect("query runs")
+                    .is_some());
+            }
+        }
+
+        #[tokio::test]
+        async fn a_bulk_write_that_fails_writes_nothing_at_all() {
+            let (_, _, attendance, log, _, people) = staffed().await;
+            // Staffing the project logged rows of its own; only what the bulk
+            // write would add is under test.
+            let before = log.recent_activity(50).await.expect("query runs").len();
+
+            let result = attendance
+                .record_many(
+                    september(),
+                    vec![
+                        (people[0].id.clone(), row(44, 176 * 60, 0)),
+                        (EmployeeId::from("ghost"), row(44, 176 * 60, 0)),
+                    ],
+                )
+                .await;
+
+            assert!(result.is_err());
+            assert_eq!(
+                attendance.get(&people[0].id, september()).await.expect("query runs"),
+                None,
+                "the row before the failure must roll back too"
+            );
+            assert_eq!(
+                log.recent_activity(50).await.expect("query runs").len(),
+                before,
+                "a rolled-back bulk write must not leave audit rows"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_sheet_gives_every_employee_a_line_recorded_or_not() {
+            let (_, _, attendance, _, project, people) = staffed().await;
+            attendance
+                .record(&people[0].id, september(), row(44, 176 * 60, 3 * 60))
+                .await
+                .expect("recorded");
+
+            let sheet = attendance.sheet(&project.id, september()).await.expect("query runs");
+
+            assert_eq!(sheet.project_id, project.id);
+            assert_eq!(sheet.period, september());
+            assert_eq!(sheet.rows.len(), 3, "everyone gets a line");
+            assert_eq!(sheet.totals.recorded, 1);
+            assert_eq!(sheet.totals.missing, 2);
+            assert_eq!(sheet.total_days(), WorkedDays::from_days(22));
+            assert_eq!(sheet.totals.overtime_minutes, 3 * 60);
+        }
+
+        #[tokio::test]
+        async fn the_sheet_is_ordered_the_way_the_employees_screen_is() {
+            let (_, _, attendance, _, project, _) = staffed().await;
+            let sheet = attendance.sheet(&project.id, september()).await.expect("query runs");
+
+            // Randrianasolo, Rasoanaivo, Razafimahatratra — by last name.
+            assert_eq!(sheet.rows.len(), 3);
+            assert!(sheet.rows.iter().all(|row| row.entry.is_none()));
+        }
+
+        #[tokio::test]
+        async fn the_sheet_of_an_empty_project_totals_zero() {
+            let (projects, _, attendance, _, _, _) = staffed().await;
+            let empty = projects
+                .create(valid(ProjectDraft::new("Toamasina Port Logistics", date("2025-09-15"))))
+                .await
+                .expect("stored");
+
+            let sheet = attendance.sheet(&empty.id, september()).await.expect("query runs");
+            assert!(sheet.rows.is_empty());
+            assert_eq!(sheet.totals.recorded, 0);
+        }
+
+        #[tokio::test]
+        async fn removing_an_employee_takes_their_attendance_with_them() {
+            let (_, employees, attendance, _, _, people) = staffed().await;
+            attendance
+                .record(&people[0].id, september(), row(44, 176 * 60, 0))
+                .await
+                .expect("recorded");
+
+            employees.delete(&people[0].id).await.expect("removed");
+
+            assert!(attendance.history(&people[0].id).await.expect("query runs").is_empty());
+        }
+
+        #[tokio::test]
+        async fn deleting_a_project_takes_the_attendance_of_everyone_on_it() {
+            let (projects, _, attendance, _, project, people) = staffed().await;
+            attendance
+                .record(&people[0].id, september(), row(44, 176 * 60, 0))
+                .await
+                .expect("recorded");
+
+            projects.delete(&project.id).await.expect("deleted");
+
+            let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM attendance")
+                .fetch_one(attendance.db().pool())
+                .await
+                .expect("query runs");
+            assert_eq!(left, 0);
+        }
+
+        #[tokio::test]
+        async fn recording_logs_a_create_and_then_updates() {
+            let (_, _, attendance, log, _, people) = staffed().await;
+
+            let stored = attendance
+                .record(&people[0].id, september(), row(44, 176 * 60, 0))
+                .await
+                .expect("recorded");
+            attendance
+                .record(&people[0].id, september(), row(40, 160 * 60, 0))
+                .await
+                .expect("recorded again");
+            attendance.clear(&people[0].id, september()).await.expect("cleared");
+
+            let history = log.history("attendance", stored.id.as_str()).await.expect("query runs");
+            let actions: Vec<AuditAction> = history.iter().map(|e| e.action).collect();
+            assert_eq!(
+                actions,
+                [AuditAction::Create, AuditAction::Update, AuditAction::Delete]
+            );
         }
     }
 }

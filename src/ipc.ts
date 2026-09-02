@@ -10,6 +10,9 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  AttendanceDraft,
+  AttendanceEntry,
+  AttendanceSheet,
   AuditEntry,
   Employee,
   EmployeeDraft,
@@ -23,6 +26,7 @@ import type {
   ProjectFilter,
   ProjectStats,
   IsoDate,
+  YearMonth,
 } from "./types";
 
 export type AppErrorKind =
@@ -140,4 +144,23 @@ export const api = {
 
   employeeStats: (id: string, asOf: IsoDate | null = null) =>
     call<EmployeeStats>("employee_stats", { id, asOf }),
+
+  // Time & attendance. No screen calls these yet — the grid is the next slice.
+  attendanceSheet: (project: string, period: YearMonth) =>
+    call<AttendanceSheet>("attendance_sheet", { project, period }),
+
+  attendanceEntry: (employee: string, period: YearMonth) =>
+    call<AttendanceEntry | null>("attendance_entry", { employee, period }),
+
+  recordAttendance: (employee: string, period: YearMonth, draft: AttendanceDraft) =>
+    call<AttendanceEntry>("record_attendance", { employee, period, draft }),
+
+  clearAttendance: (employee: string, period: YearMonth) =>
+    call<AttendanceEntry | null>("clear_attendance", { employee, period }),
+
+  fillAttendanceFromSchedule: (project: string, period: YearMonth) =>
+    call<AttendanceSheet>("fill_attendance_from_schedule", { project, period }),
+
+  employeeAttendance: (employee: string) =>
+    call<AttendanceEntry[]>("employee_attendance", { employee }),
 };

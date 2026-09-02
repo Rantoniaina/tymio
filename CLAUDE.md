@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Tauri v2 + React/TS/Vite shell. The **projects** and **employees** slices are built end to end (Rust + UI + Playwright). Contracts, leave, attendance and payroll are still to come — the nav and the employee-file tabs for those render a `ComingSoon` panel saying which slice they wait on. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
+Tauri v2 + React/TS/Vite shell. The **projects** and **employees** slices are built end to end (Rust + UI + Playwright); the **time & attendance** backend is built and tested with no UI yet. Contracts, leave and payroll are still to come — the nav and the employee-file tabs for those render a `ComingSoon` panel saying which slice they wait on. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
 
 Front end under `src/`:
 
@@ -22,14 +22,16 @@ Rust layout under `src-tauri/src/`:
 | `domain/calendar.rs` | `WeekdayMask`, `DayLength` (minutes), `YearMonth`, `HolidaySet`, `WorkCalendar` — working-day counting |
 | `domain/project.rs` | `Project`, `ProjectStatus`, `ProjectDraft` → `ValidProject`, `Holiday`, `ProjectFilter`, `DurationProgress`, `ProjectStats`, `PortfolioStats` |
 | `domain/employee.rs` | `Employee`, `EmployeeDraft` → `ValidEmployee`, `EmployeeFilter`, `EmployeeStats`; age, whole-months service, and `months_worked_in` (the mockup's accrual driver) |
+| `domain/attendance.rs` | `WorkedDays` (half-days), `WorkedTime` (minutes), `AttendanceDraft` → `ValidAttendance`, `AttendanceSheet`/`Totals`, and `from_standard_schedule` — the "Fill from standard schedule" rule |
 | `domain/mod.rs` | `ValidationError`/`ValidationErrors`, the `id_type!` newtype macro |
-| `repo/mod.rs` | `ProjectRepository`, `EmployeeRepository` and `ActivityRepository` traits, `AuditEntry` |
+| `repo/mod.rs` | `ProjectRepository`, `EmployeeRepository`, `AttendanceRepository` and `ActivityRepository` traits, `AuditEntry` |
 | `repo/sqlite.rs` | `SqliteProjectRepository`, `SqliteEmployeeRepository`, `SqliteActivityRepository` — **one struct per aggregate**, because several traits on one type make every `create`/`get`/`list` call ambiguous. Every write is a transaction that also appends its audit row |
 | `db.rs` | pool setup, pragmas, embedded migrations, `Db::in_memory()` for tests |
 | `commands.rs` | `AppState::new(db)` builds one repository per trait; validation happens here, then one-line `#[tauri::command]` wrappers |
 | `error.rs` | `AppError`, serialised to the front end as `{ kind, message, fields }` |
 | `migrations/0001_init.sql` | `projects`, `project_holidays`, `audit_log` |
 | `migrations/0002_employees.sql` | `employees` — CIN unique where recorded, cascade from the project |
+| `migrations/0003_attendance.sql` | `attendance` — one row per `(employee, period)`, days in half-days, hours in minutes |
 
 ### Testing
 
@@ -108,6 +110,8 @@ The mockup encodes concrete business rules that exist nowhere else in prose. Pre
 **Leave**: an annual grant on 1 January, and/or N days accrued per month worked (a contract can have either, both, or neither). Once the balance is empty, further leave is unpaid and deducted from salary. Leave types seen: Annual, Sick, Unpaid. Request statuses: Pending, Approved, Rejected.
 
 **Time & attendance**: per employee, per month — days worked, hours worked, overtime hours. Defaults come from the project's standard schedule ("Fill from standard schedule"), then are manually adjustable. This reconciles the README's "derived from a work calendar" with the mockup's editable grid: the calendar seeds the numbers, the user can override them.
+
+*Built.* Days are stored in **half-days** and hours in **minutes** — never floats. Recording a month is an upsert on `(employee, period)`, not a create/update pair, because that is what the grid does. Seeding clips to the part of the month a person was actually employed for, carries existing overtime over (the calendar cannot know it), and has a `leave` parameter that the leave slice fills in — it is passed zero for now. `source` (`schedule` | `manual`) records which of the two last wrote each row.
 
 **Contract fields**: type, rate, start, end, weekly hours (40), probation months (3), annual grant days, monthly accrual days.
 

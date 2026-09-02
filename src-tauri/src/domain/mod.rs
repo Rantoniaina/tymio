@@ -1,5 +1,6 @@
 //! Domain types and rules. Nothing in here knows about SQL, Tauri or the UI.
 
+pub mod attendance;
 pub mod calendar;
 pub mod employee;
 pub mod project;
