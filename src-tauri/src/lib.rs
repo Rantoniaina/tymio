@@ -41,6 +41,12 @@ pub fn run() {
             commands::update_employee,
             commands::delete_employee,
             commands::employee_stats,
+            commands::attendance_sheet,
+            commands::record_attendance,
+            commands::attendance_entry,
+            commands::clear_attendance,
+            commands::fill_attendance_from_schedule,
+            commands::employee_attendance,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

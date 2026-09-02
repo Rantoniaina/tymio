@@ -157,6 +157,37 @@ fn dispatch(
         "delete_employee" => {
             encode(runtime.block_on(state.delete_employee(required(args, "id")?))?)
         }
+        "attendance_sheet" => encode(
+            runtime.block_on(
+                state.attendance_sheet(required(args, "project")?, required(args, "period")?),
+            )?,
+        ),
+        "attendance_entry" => encode(
+            runtime.block_on(
+                state.attendance_entry(required(args, "employee")?, required(args, "period")?),
+            )?,
+        ),
+        "record_attendance" => encode(
+            runtime.block_on(state.record_attendance(
+                required(args, "employee")?,
+                required(args, "period")?,
+                required(args, "draft")?,
+            ))?,
+        ),
+        "clear_attendance" => encode(
+            runtime.block_on(
+                state.clear_attendance(required(args, "employee")?, required(args, "period")?),
+            )?,
+        ),
+        "fill_attendance_from_schedule" => encode(
+            runtime.block_on(state.fill_attendance_from_schedule(
+                required(args, "project")?,
+                required(args, "period")?,
+            ))?,
+        ),
+        "employee_attendance" => {
+            encode(runtime.block_on(state.employee_attendance(required(args, "employee")?))?)
+        }
         "employee_stats" => encode(
             runtime.block_on(state.employee_stats(required(args, "id")?, arg(args, "asOf")?))?,
         ),

@@ -167,3 +167,35 @@ export function avatarColour(seed: string): string {
   for (const character of seed) hash = (hash * 31 + character.codePointAt(0)!) >>> 0;
   return AVATAR_COLOURS[hash % AVATAR_COLOURS.length];
 }
+
+/* ---------------------------------------------------------- attendance units */
+
+/** Half-days → the decimal the grid shows: `43` → `21.5`, `44` → `22`. */
+export function daysFromHalves(halves: number): string {
+  return halves % 2 === 0 ? String(halves / 2) : (halves / 2).toFixed(1);
+}
+
+/** The grid's decimal back into half-days, rounded to the nearest half. */
+export function halvesFromDays(days: number): number {
+  return Math.round(days * 2);
+}
+
+/**
+ * Minutes → decimal hours for an input box. Two decimals is enough for
+ * quarter-hours, which is as fine as the seeded values ever get.
+ */
+export function hoursFromMinutes(minutes: number): string {
+  const hours = minutes / 60;
+  return Number.isInteger(hours) ? String(hours) : hours.toFixed(2).replace(/0+$/, "");
+}
+
+export function minutesFromHours(hours: number): number {
+  return Math.round(hours * 60);
+}
+
+/** Minutes as the totals row writes them: `176 h`, `161 h 15`. */
+export function formatMinutes(minutes: number): string {
+  const whole = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0 ? `${whole} h` : `${whole} h ${String(rest).padStart(2, "0")}`;
+}

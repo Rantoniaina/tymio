@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::calendar::HolidaySet;
+use crate::domain::attendance::{AttendanceEntry, AttendanceSheet, ValidAttendance};
+use crate::domain::calendar::{HolidaySet, YearMonth};
 use crate::domain::employee::{
     Employee, EmployeeFilter, EmployeeId, EmployeeStats, ValidEmployee,
 };
@@ -85,6 +86,50 @@ pub trait EmployeeRepository: Send + Sync {
     async fn headcount(&self, project: &ProjectId) -> Result<u32>;
 
     async fn stats(&self, id: &EmployeeId, as_of: NaiveDate) -> Result<EmployeeStats>;
+}
+
+/// Everything the time & attendance screen needs from storage.
+///
+/// There is no `create`/`update` pair: a month is either recorded or it is
+/// not, and recording it again replaces what was there. That is what the
+/// grid does, and modelling it as an upsert keeps the two from drifting.
+#[async_trait]
+pub trait AttendanceRepository: Send + Sync {
+    async fn get(
+        &self,
+        employee: &EmployeeId,
+        period: YearMonth,
+    ) -> Result<Option<AttendanceEntry>>;
+
+    /// Records (or replaces) one employee's month.
+    async fn record(
+        &self,
+        employee: &EmployeeId,
+        period: YearMonth,
+        entry: ValidAttendance,
+    ) -> Result<AttendanceEntry>;
+
+    /// Records a whole grid at once, in one transaction — "Fill from standard
+    /// schedule" must not half-apply.
+    async fn record_many(
+        &self,
+        period: YearMonth,
+        entries: Vec<(EmployeeId, ValidAttendance)>,
+    ) -> Result<u32>;
+
+    /// Removes a month's record. `None` when there was nothing recorded, which
+    /// is not an error — a blank month is a legitimate state.
+    async fn clear(
+        &self,
+        employee: &EmployeeId,
+        period: YearMonth,
+    ) -> Result<Option<AttendanceEntry>>;
+
+    /// One project's grid: every employee on it, recorded or not.
+    async fn sheet(&self, project: &ProjectId, period: YearMonth) -> Result<AttendanceSheet>;
+
+    /// One person's history, most recent month first.
+    async fn history(&self, employee: &EmployeeId) -> Result<Vec<AttendanceEntry>>;
 }
 
 /// What happened to a record. The `audit_log` CHECK accepts nothing else.

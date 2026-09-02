@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
+import { AttendanceView } from "./AttendanceView";
 import { ComingSoon } from "../components/ComingSoon";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { EmployeeModal } from "../components/EmployeeModal";
@@ -8,7 +9,16 @@ import { EmployeeFile, type EmployeeTab } from "./EmployeeFile";
 import { EmployeesView, fullName } from "./EmployeesView";
 import { AppError, api } from "../ipc";
 import { asOfFor, formatDate, formatMonth, monthKey, parseMonthKey, recentMonths, thisMonth } from "../format";
-import type { Employee, EmployeeDraft, EmployeeStats, Project, ProjectStats, YearMonth } from "../types";
+import type {
+  AttendanceDraft,
+  AttendanceSheet,
+  Employee,
+  EmployeeDraft,
+  EmployeeStats,
+  Project,
+  ProjectStats,
+  YearMonth,
+} from "../types";
 
 type View = "overview" | "employees" | "employee" | "time" | "leaves" | "payroll" | "reports";
 
@@ -33,7 +43,6 @@ const TITLES: Record<View, string> = {
 
 /** Views whose backend slice has not been built. */
 const NOT_BUILT: Partial<Record<View, string>> = {
-  time: "Days worked, hours and overtime per person per month arrive with the attendance slice, seeded from this project's work calendar.",
   leaves: "Requests, approvals and the append-only balance ledger arrive with the leave slice.",
   payroll: "Monthly runs, the payslip breakdown and locking arrive with the payroll slice, which needs contracts and attendance first.",
   reports: "CSV and JSON export arrive once there is something to export.",
@@ -50,6 +59,13 @@ export function Workspace({ project, say, onLeave }: WorkspaceProps) {
   const [month, setMonth] = useState<YearMonth>(() => thisMonth());
 
   const [employees, setEmployees] = useState<Employee[]>([]);
+  /** Everyone on the project, unfiltered — the attendance grid is not searched. */
+  const [roster, setRoster] = useState<Employee[]>([]);
+  const [sheet, setSheet] = useState<AttendanceSheet | null>(null);
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
+  /** Bumped whenever the grid is replaced wholesale rather than row by row. */
+  const [gridVersion, setGridVersion] = useState(0);
+  const [filling, setFilling] = useState(false);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -66,15 +82,19 @@ export function Workspace({ project, say, onLeave }: WorkspaceProps) {
   const asOf = asOfFor(month);
 
   const load = useCallback(
-    async (search: string, at: string) => {
+    async (search: string, at: string, forPeriod: YearMonth) => {
       setLoading(true);
       try {
-        const [listed, stats] = await Promise.all([
+        const [listed, everyone, stats, grid] = await Promise.all([
           api.listEmployees({ project: project.id, query: search || null }),
+          api.listEmployees({ project: project.id, query: null }),
           api.projectStats(project.id, at),
+          api.attendanceSheet(project.id, forPeriod),
         ]);
         setEmployees(listed);
+        setRoster(everyone);
         setProjectStats(stats);
+        setSheet(grid);
         setLoadError(null);
       } catch (raw) {
         setLoadError(AppError.from(raw).message);
@@ -86,8 +106,8 @@ export function Workspace({ project, say, onLeave }: WorkspaceProps) {
   );
 
   useEffect(() => {
-    void load(query, asOf);
-  }, [load, query, asOf]);
+    void load(query, asOf, month);
+  }, [load, query, asOf, month]);
 
   // The open employee's derived numbers follow the period selector.
   useEffect(() => {
@@ -114,7 +134,7 @@ export function Workspace({ project, say, onLeave }: WorkspaceProps) {
     setForm(null);
     say(target ? "Employee saved" : `Added ${fullName(saved)}`);
     if (openEmployee?.id === saved.id) setOpenEmployee(saved);
-    await load(query, asOf);
+    await load(query, asOf, month);
   }
 
   async function confirmRemoval() {
@@ -128,11 +148,53 @@ export function Workspace({ project, say, onLeave }: WorkspaceProps) {
         setView("employees");
       }
       setPendingRemoval(null);
-      await load(query, asOf);
+      await load(query, asOf, month);
     } catch (raw) {
       say(AppError.from(raw).message);
     } finally {
       setRemoving(false);
+    }
+  }
+
+  async function recordAttendance(employeeId: string, draft: AttendanceDraft) {
+    try {
+      await api.recordAttendance(employeeId, month, draft);
+      setRowErrors((current) => {
+        const { [employeeId]: _gone, ...rest } = current;
+        return rest;
+      });
+      setSheet(await api.attendanceSheet(project.id, month));
+    } catch (raw) {
+      // The rejected value stays on screen so it can be corrected; the row
+      // keeps the message until it saves cleanly.
+      const failure = AppError.from(raw);
+      const message = failure.fields[0]?.message ?? failure.message;
+      setRowErrors((current) => ({ ...current, [employeeId]: message }));
+    }
+  }
+
+  async function clearAttendance(employeeId: string) {
+    await api.clearAttendance(employeeId, month);
+    setRowErrors((current) => {
+      const { [employeeId]: _gone, ...rest } = current;
+      return rest;
+    });
+    setSheet(await api.attendanceSheet(project.id, month));
+    setGridVersion((version) => version + 1);
+  }
+
+  async function fillFromSchedule() {
+    setFilling(true);
+    try {
+      const filled = await api.fillAttendanceFromSchedule(project.id, month);
+      setSheet(filled);
+      setRowErrors({});
+      setGridVersion((version) => version + 1);
+      say(`Filled ${filled.totals.recorded} of ${filled.rows.length} from the schedule`);
+    } catch (raw) {
+      say(AppError.from(raw).message);
+    } finally {
+      setFilling(false);
     }
   }
 
@@ -165,7 +227,13 @@ export function Workspace({ project, say, onLeave }: WorkspaceProps) {
                 <span className="rail__marker" aria-hidden="true" />
                 <span className="rail__label">{entry.label}</span>
                 <span className="rail__badge">
-                  {entry.id === "employees" ? headcount || "" : NOT_BUILT[entry.id] ? "soon" : ""}
+                  {entry.id === "employees"
+                    ? headcount || ""
+                    : entry.id === "time"
+                      ? sheet?.totals.recorded || ""
+                      : NOT_BUILT[entry.id]
+                        ? "soon"
+                        : ""}
                 </span>
               </button>
             );
@@ -251,6 +319,22 @@ export function Workspace({ project, say, onLeave }: WorkspaceProps) {
               onOpen={open}
               onEdit={(employee) => setForm({ employee })}
               onRemove={setPendingRemoval}
+            />
+          )}
+
+          {view === "time" && (
+            <AttendanceView
+              sheet={sheet}
+              roster={roster}
+              period={month}
+              busy={filling}
+              errors={rowErrors}
+              // Keyed on the sheet's own period, not the selected one: the
+              // boxes must not reset until the new month's data has arrived.
+              syncKey={`${sheet ? monthKey(sheet.period) : "none"}:${gridVersion}`}
+              onFill={() => void fillFromSchedule()}
+              onRecord={(id, draft) => void recordAttendance(id, draft)}
+              onClear={(id) => void clearAttendance(id)}
             />
           )}
 
