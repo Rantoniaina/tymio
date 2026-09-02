@@ -1,0 +1,985 @@
+//! The SQLite implementation of the storage traits.
+//!
+//! Two habits run through this file. Every write happens in a transaction that
+//! also appends its audit row, so a change can never be recorded without being
+//! logged or logged without being made. And every row is mapped by hand rather
+//! than derived, because the domain types (a weekday bitmask, a status enum,
+//! minutes-not-hours) are narrower than the columns that hold them.
+
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{Row, SqliteConnection};
+
+use crate::db::Db;
+use crate::domain::project::{
+    Holiday, HolidayId, PortfolioStats, Project, ProjectFilter, ProjectId, ProjectStats,
+    ProjectStatus, ValidHoliday, ValidProject,
+};
+use crate::domain::calendar::{DayLength, WeekdayMask, WorkCalendar};
+use crate::error::{AppError, Result};
+
+use super::{ActivityRepository, AuditAction, AuditEntry, ProjectRepository};
+
+const PROJECT_ENTITY: &str = "project";
+const HOLIDAY_ENTITY: &str = "project_holiday";
+
+const PROJECT_COLUMNS: &str = "id, name, client, location, status, start_date, end_date, \
+                               working_days_mask, hours_per_day_minutes, created_at, updated_at";
+
+#[derive(Debug, Clone)]
+pub struct SqliteRepository {
+    db: Db,
+}
+
+impl SqliteRepository {
+    pub fn new(db: Db) -> Self {
+        SqliteRepository { db }
+    }
+
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+}
+
+/// Appends to the audit log. Takes the transaction's connection so the entry
+/// lands or rolls back with the change it describes.
+async fn record(
+    conn: &mut SqliteConnection,
+    at: DateTime<Utc>,
+    entity: &str,
+    entity_id: &str,
+    action: AuditAction,
+    detail: Option<String>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO audit_log (at, entity, entity_id, action, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(at)
+    .bind(entity)
+    .bind(entity_id)
+    .bind(action.as_str())
+    .bind(detail)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+fn snapshot<T: serde::Serialize>(value: &T) -> Option<String> {
+    serde_json::to_string(value).ok()
+}
+
+fn corrupt(id: &str, detail: impl ToString) -> AppError {
+    AppError::CorruptRow {
+        entity: PROJECT_ENTITY,
+        id: id.to_owned(),
+        detail: detail.to_string(),
+    }
+}
+
+fn project_from_row(row: &SqliteRow) -> Result<Project> {
+    let id: String = row.try_get("id")?;
+
+    let status: String = row.try_get("status")?;
+    let status: ProjectStatus = status.parse().map_err(|e| corrupt(&id, e))?;
+
+    let mask: i64 = row.try_get("working_days_mask")?;
+    let working_days = u8::try_from(mask)
+        .map_err(|_| corrupt(&id, format!("weekday mask {mask} does not fit in a byte")))
+        .and_then(|bits| WeekdayMask::from_bits(bits).map_err(|e| corrupt(&id, e)))?;
+
+    let minutes: i64 = row.try_get("hours_per_day_minutes")?;
+    let day_length = DayLength::from_minutes(minutes).map_err(|e| corrupt(&id, e))?;
+
+    Ok(Project {
+        id: ProjectId::from(id),
+        name: row.try_get("name")?,
+        client: row.try_get("client")?,
+        location: row.try_get("location")?,
+        status,
+        start: row.try_get("start_date")?,
+        end: row.try_get("end_date")?,
+        calendar: WorkCalendar::new(working_days, day_length),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn holiday_from_row(row: &SqliteRow) -> Result<Holiday> {
+    Ok(Holiday {
+        id: HolidayId::from(row.try_get::<String, _>("id")?),
+        project_id: ProjectId::from(row.try_get::<String, _>("project_id")?),
+        date: row.try_get("date")?,
+        name: row.try_get("name")?,
+    })
+}
+
+fn audit_from_row(row: &SqliteRow) -> Result<AuditEntry> {
+    let id: i64 = row.try_get("id")?;
+    let action: String = row.try_get("action")?;
+    let action = action.parse().map_err(|e: String| AppError::CorruptRow {
+        entity: "audit_log",
+        id: id.to_string(),
+        detail: e,
+    })?;
+
+    Ok(AuditEntry {
+        id,
+        at: row.try_get("at")?,
+        entity: row.try_get("entity")?,
+        entity_id: row.try_get("entity_id")?,
+        action,
+        detail: row.try_get("detail")?,
+    })
+}
+
+/// Writes every column of a project. Shared by insert and update so the two
+/// can never disagree about what a project is made of.
+fn bind_project<'q>(
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    project: &'q Project,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    query
+        .bind(project.name.as_str())
+        .bind(project.client.as_deref())
+        .bind(project.location.as_deref())
+        .bind(project.status.as_str())
+        .bind(project.start)
+        .bind(project.end)
+        .bind(i64::from(project.calendar.working_days.bits()))
+        .bind(i64::from(project.calendar.day_length.minutes()))
+}
+
+#[async_trait]
+impl ProjectRepository for SqliteRepository {
+    async fn create(&self, draft: ValidProject) -> Result<Project> {
+        let now = Utc::now();
+        let project = draft.into_project(ProjectId::new(), now);
+
+        let mut tx = self.db.pool().begin().await?;
+
+        let insert = sqlx::query(
+            "INSERT INTO projects (name, client, location, status, start_date, end_date, \
+             working_days_mask, hours_per_day_minutes, id, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        );
+        bind_project(insert, &project)
+            .bind(project.id.as_str())
+            .bind(project.created_at)
+            .bind(project.updated_at)
+            .execute(&mut *tx)
+            .await?;
+
+        record(
+            &mut tx,
+            now,
+            PROJECT_ENTITY,
+            project.id.as_str(),
+            AuditAction::Create,
+            snapshot(&project),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(project)
+    }
+
+    async fn get(&self, id: &ProjectId) -> Result<Option<Project>> {
+        let row = sqlx::query(&format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"))
+            .bind(id.as_str())
+            .fetch_optional(self.db.pool())
+            .await?;
+
+        row.as_ref().map(project_from_row).transpose()
+    }
+
+    async fn list(&self, filter: &ProjectFilter) -> Result<Vec<Project>> {
+        // Status narrows in SQL; the search box is applied in Rust so that case
+        // folding is Unicode-correct (SQLite's NOCASE only folds ASCII, and
+        // these are Malagasy names). The project list is tens of rows, not
+        // thousands — this is not the query to optimise.
+        let rows = sqlx::query(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM projects WHERE ?1 IS NULL OR status = ?1"
+        ))
+        .bind(filter.status.map(|s| s.as_str()))
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let mut projects = rows
+            .iter()
+            .map(project_from_row)
+            .filter(|p| p.as_ref().map(|p| filter.matches_text(p)).unwrap_or(true))
+            .collect::<Result<Vec<_>>>()?;
+
+        projects.sort_by(|a, b| {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(projects)
+    }
+
+    async fn update(&self, id: &ProjectId, draft: ValidProject) -> Result<Project> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let existing = sqlx::query(&format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"))
+            .bind(id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::not_found(PROJECT_ENTITY, id))?;
+        let existing = project_from_row(&existing)?;
+
+        let updated = draft.onto(&existing, now);
+
+        let update = sqlx::query(
+            "UPDATE projects SET name = ?1, client = ?2, location = ?3, status = ?4, \
+             start_date = ?5, end_date = ?6, working_days_mask = ?7, \
+             hours_per_day_minutes = ?8, updated_at = ?9 WHERE id = ?10",
+        );
+        bind_project(update, &updated)
+            .bind(updated.updated_at)
+            .bind(updated.id.as_str())
+            .execute(&mut *tx)
+            .await?;
+
+        record(
+            &mut tx,
+            now,
+            PROJECT_ENTITY,
+            updated.id.as_str(),
+            AuditAction::Update,
+            snapshot(&updated),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    async fn delete(&self, id: &ProjectId) -> Result<Project> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let row = sqlx::query(&format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"))
+            .bind(id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::not_found(PROJECT_ENTITY, id))?;
+        let deleted = project_from_row(&row)?;
+
+        sqlx::query("DELETE FROM projects WHERE id = ?1")
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+
+        // The snapshot is the whole point of logging a delete: the row itself
+        // is gone, cascade and all.
+        record(
+            &mut tx,
+            now,
+            PROJECT_ENTITY,
+            deleted.id.as_str(),
+            AuditAction::Delete,
+            snapshot(&deleted),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    async fn portfolio_stats(&self) -> Result<PortfolioStats> {
+        let rows = sqlx::query("SELECT status, count(*) AS n FROM projects GROUP BY status")
+            .fetch_all(self.db.pool())
+            .await?;
+
+        let mut stats = PortfolioStats::default();
+        for row in &rows {
+            let status: String = row.try_get("status")?;
+            let count: i64 = row.try_get("n")?;
+            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            match status.parse().map_err(|e| corrupt(&status, e))? {
+                ProjectStatus::Active => stats.active = count,
+                ProjectStatus::Paused => stats.paused = count,
+                ProjectStatus::Closed => stats.closed = count,
+            }
+            stats.total += count;
+        }
+        Ok(stats)
+    }
+
+    async fn stats(&self, id: &ProjectId, as_of: NaiveDate) -> Result<ProjectStats> {
+        let project = self.require(id).await?;
+        let holidays = self.holiday_set(id).await?;
+        Ok(ProjectStats::compute(&project, &holidays, as_of))
+    }
+
+    async fn add_holiday(&self, project: &ProjectId, holiday: ValidHoliday) -> Result<Holiday> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        // The foreign key would catch this, but "no project with id …" is a
+        // better answer than a constraint code.
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM projects WHERE id = ?1")
+            .bind(project.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::not_found(PROJECT_ENTITY, project));
+        }
+
+        let stored = Holiday {
+            id: HolidayId::new(),
+            project_id: project.clone(),
+            date: holiday.date(),
+            name: holiday.name().to_owned(),
+        };
+
+        sqlx::query(
+            "INSERT INTO project_holidays (id, project_id, date, name) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(stored.id.as_str())
+        .bind(stored.project_id.as_str())
+        .bind(stored.date)
+        .bind(stored.name.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            AppError::from_sqlx(e, || {
+                format!("{} is already a holiday on this project", stored.date)
+            })
+        })?;
+
+        record(
+            &mut tx,
+            now,
+            HOLIDAY_ENTITY,
+            stored.id.as_str(),
+            AuditAction::Create,
+            snapshot(&stored),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(stored)
+    }
+
+    async fn holidays(&self, project: &ProjectId) -> Result<Vec<Holiday>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, date, name FROM project_holidays \
+             WHERE project_id = ?1 ORDER BY date ASC",
+        )
+        .bind(project.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+
+        rows.iter().map(holiday_from_row).collect()
+    }
+
+    async fn remove_holiday(&self, project: &ProjectId, holiday: &HolidayId) -> Result<()> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let affected = sqlx::query("DELETE FROM project_holidays WHERE id = ?1 AND project_id = ?2")
+            .bind(holiday.as_str())
+            .bind(project.as_str())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        if affected == 0 {
+            return Err(AppError::not_found(HOLIDAY_ENTITY, holiday));
+        }
+
+        record(&mut tx, now, HOLIDAY_ENTITY, holiday.as_str(), AuditAction::Delete, None).await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ActivityRepository for SqliteRepository {
+    async fn recent_activity(&self, limit: u32) -> Result<Vec<AuditEntry>> {
+        let rows = sqlx::query(
+            "SELECT id, at, entity, entity_id, action, detail FROM audit_log \
+             ORDER BY id DESC LIMIT ?1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(self.db.pool())
+        .await?;
+
+        rows.iter().map(audit_from_row).collect()
+    }
+
+    async fn history(&self, entity: &str, entity_id: &str) -> Result<Vec<AuditEntry>> {
+        let rows = sqlx::query(
+            "SELECT id, at, entity, entity_id, action, detail FROM audit_log \
+             WHERE entity = ?1 AND entity_id = ?2 ORDER BY id ASC",
+        )
+        .bind(entity)
+        .bind(entity_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        rows.iter().map(audit_from_row).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::domain::calendar::{HolidaySet, WeekdayMask, YearMonth};
+    use crate::domain::project::{HolidayDraft, ProjectDraft};
+
+    fn date(s: &str) -> NaiveDate {
+        s.parse().expect("test date is well formed")
+    }
+
+    async fn repo() -> SqliteRepository {
+        SqliteRepository::new(Db::in_memory().await.expect("in-memory database opens"))
+    }
+
+    fn valid(draft: ProjectDraft) -> ValidProject {
+        draft.validate().expect("test draft is valid")
+    }
+
+    /// The mockup's first project, with everything filled in.
+    fn solar_farm() -> ProjectDraft {
+        let mut draft = ProjectDraft::new("Ambatolampy Solar Farm", date("2026-02-01"));
+        draft.client = Some("JIRAMA".into());
+        draft.location = Some("Vakinankaratra".into());
+        draft.end = Some(date("2027-06-30"));
+        draft
+    }
+
+    async fn seed_portfolio(repo: &SqliteRepository) -> Vec<Project> {
+        let mut port = ProjectDraft::new("Toamasina Port Logistics", date("2025-09-15"));
+        port.client = Some("SMMC".into());
+        port.location = Some("Toamasina".into());
+
+        let mut fit_out = ProjectDraft::new("Antananarivo HQ Fit-out", date("2026-05-01"));
+        fit_out.client = Some("Tymio internal".into());
+        fit_out.status = ProjectStatus::Paused;
+
+        let mut resort = ProjectDraft::new("Nosy Be Resort Staffing", date("2025-01-10"));
+        resort.client = Some("Baobab Hôtels".into());
+        resort.status = ProjectStatus::Closed;
+
+        let mut created = Vec::new();
+        for draft in [solar_farm(), port, fit_out, resort] {
+            created.push(repo.create(valid(draft)).await.expect("seed project is stored"));
+        }
+        created
+    }
+
+    mod create_and_read {
+        use super::*;
+
+        #[tokio::test]
+        async fn a_created_project_reads_back_identically() {
+            let repo = repo().await;
+            let created = repo.create(valid(solar_farm())).await.expect("stored");
+
+            let fetched = repo.get(&created.id).await.expect("query runs").expect("it is there");
+            assert_eq!(fetched, created);
+            assert_eq!(fetched.name, "Ambatolampy Solar Farm");
+            assert_eq!(fetched.client.as_deref(), Some("JIRAMA"));
+            assert_eq!(fetched.status, ProjectStatus::Active);
+            assert_eq!(fetched.start, date("2026-02-01"));
+            assert_eq!(fetched.end, Some(date("2027-06-30")));
+        }
+
+        #[tokio::test]
+        async fn an_open_ended_project_keeps_its_missing_end_date() {
+            let repo = repo().await;
+            let created = repo
+                .create(valid(ProjectDraft::new("Ongoing maintenance", date("2026-01-01"))))
+                .await
+                .expect("stored");
+
+            let fetched = repo.get(&created.id).await.expect("query runs").expect("it is there");
+            assert_eq!(fetched.end, None);
+            assert_eq!(fetched.client, None);
+            assert_eq!(fetched.location, None);
+        }
+
+        #[tokio::test]
+        async fn a_non_default_work_calendar_survives_the_round_trip() {
+            let repo = repo().await;
+            let mut draft = solar_farm();
+            draft.working_days = WeekdayMask::MON_SAT;
+            draft.day_length = DayLength::from_hours_and_minutes(7, 30).expect("7h30");
+
+            let created = repo.create(valid(draft)).await.expect("stored");
+            let fetched = repo.get(&created.id).await.expect("query runs").expect("it is there");
+
+            assert_eq!(fetched.calendar.working_days, WeekdayMask::MON_SAT);
+            assert_eq!(fetched.calendar.day_length.minutes(), 450);
+        }
+
+        #[tokio::test]
+        async fn each_project_gets_its_own_identity() {
+            let repo = repo().await;
+            let first = repo.create(valid(solar_farm())).await.expect("stored");
+            let second = repo.create(valid(solar_farm())).await.expect("stored");
+
+            assert_ne!(first.id, second.id, "same details, different projects");
+        }
+
+        #[tokio::test]
+        async fn an_unknown_id_is_none_but_requiring_it_is_an_error() {
+            let repo = repo().await;
+            let missing = ProjectId::from("no-such-project");
+
+            assert_eq!(repo.get(&missing).await.expect("query runs"), None);
+            assert!(matches!(
+                repo.require(&missing).await,
+                Err(AppError::NotFound { entity: "project", .. })
+            ));
+        }
+    }
+
+    mod listing {
+        use super::*;
+
+        #[tokio::test]
+        async fn an_empty_filter_returns_everything_by_name() {
+            let repo = repo().await;
+            seed_portfolio(&repo).await;
+
+            let all = repo.list(&ProjectFilter::default()).await.expect("query runs");
+            let names: Vec<&str> = all.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "Ambatolampy Solar Farm",
+                    "Antananarivo HQ Fit-out",
+                    "Nosy Be Resort Staffing",
+                    "Toamasina Port Logistics",
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn the_status_chips_narrow_the_list() {
+            let repo = repo().await;
+            seed_portfolio(&repo).await;
+
+            let active = repo
+                .list(&ProjectFilter::with_status(ProjectStatus::Active))
+                .await
+                .expect("query runs");
+            assert_eq!(active.len(), 2);
+            assert!(active.iter().all(|p| p.status == ProjectStatus::Active));
+
+            let closed = repo
+                .list(&ProjectFilter::with_status(ProjectStatus::Closed))
+                .await
+                .expect("query runs");
+            assert_eq!(closed.len(), 1);
+            assert_eq!(closed[0].name, "Nosy Be Resort Staffing");
+        }
+
+        #[tokio::test]
+        async fn the_search_box_matches_client_and_location_too() {
+            let repo = repo().await;
+            seed_portfolio(&repo).await;
+
+            let by_client = repo.list(&ProjectFilter::search("jirama")).await.expect("query runs");
+            assert_eq!(by_client.len(), 1);
+            assert_eq!(by_client[0].name, "Ambatolampy Solar Farm");
+
+            let by_location =
+                repo.list(&ProjectFilter::search("TOAMASINA")).await.expect("query runs");
+            assert_eq!(by_location.len(), 1);
+
+            // Accented text folds correctly — this is why the search is not
+            // left to SQLite's ASCII-only NOCASE.
+            let accented = repo.list(&ProjectFilter::search("hôtels")).await.expect("query runs");
+            assert_eq!(accented.len(), 1);
+            assert_eq!(accented[0].name, "Nosy Be Resort Staffing");
+        }
+
+        #[tokio::test]
+        async fn status_and_search_apply_together() {
+            let repo = repo().await;
+            seed_portfolio(&repo).await;
+
+            let filter = ProjectFilter {
+                status: Some(ProjectStatus::Active),
+                query: Some("nosy".into()),
+            };
+            // The Nosy Be project is closed, so this matches nothing.
+            assert!(repo.list(&filter).await.expect("query runs").is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_empty_database_lists_nothing_rather_than_failing() {
+            let repo = repo().await;
+            assert!(repo.list(&ProjectFilter::default()).await.expect("query runs").is_empty());
+        }
+    }
+
+    mod updating {
+        use super::*;
+
+        #[tokio::test]
+        async fn an_edit_replaces_the_fields_and_keeps_the_identity() {
+            let repo = repo().await;
+            let created = repo.create(valid(solar_farm())).await.expect("stored");
+
+            let mut edit = solar_farm();
+            edit.name = "Ambatolampy Solar Farm — phase 2".into();
+            edit.status = ProjectStatus::Paused;
+            edit.end = Some(date("2027-12-31"));
+            let updated = repo.update(&created.id, valid(edit)).await.expect("update runs");
+
+            assert_eq!(updated.id, created.id);
+            assert_eq!(updated.created_at, created.created_at);
+            assert!(updated.updated_at >= created.updated_at);
+            assert_eq!(updated.name, "Ambatolampy Solar Farm — phase 2");
+            assert_eq!(updated.status, ProjectStatus::Paused);
+            assert_eq!(updated.end, Some(date("2027-12-31")));
+
+            let refetched = repo.get(&created.id).await.expect("query runs").expect("still there");
+            assert_eq!(refetched, updated);
+        }
+
+        #[tokio::test]
+        async fn an_edit_can_clear_an_optional_field() {
+            let repo = repo().await;
+            let created = repo.create(valid(solar_farm())).await.expect("stored");
+            assert!(created.client.is_some());
+
+            let mut edit = solar_farm();
+            edit.client = None;
+            let updated = repo.update(&created.id, valid(edit)).await.expect("update runs");
+
+            assert_eq!(updated.client, None);
+        }
+
+        #[tokio::test]
+        async fn editing_a_project_that_is_gone_is_an_error() {
+            let repo = repo().await;
+            let result = repo.update(&ProjectId::from("ghost"), valid(solar_farm())).await;
+
+            assert!(matches!(result, Err(AppError::NotFound { entity: "project", .. })));
+        }
+
+        #[tokio::test]
+        async fn a_failed_edit_leaves_nothing_behind() {
+            let repo = repo().await;
+            let before = repo.recent_activity(10).await.expect("query runs").len();
+
+            let _ = repo.update(&ProjectId::from("ghost"), valid(solar_farm())).await;
+
+            let after = repo.recent_activity(10).await.expect("query runs").len();
+            assert_eq!(before, after, "a rolled-back edit must not leave an audit row");
+        }
+    }
+
+    mod deleting {
+        use super::*;
+
+        #[tokio::test]
+        async fn deleting_returns_what_was_deleted_and_removes_it() {
+            let repo = repo().await;
+            let created = repo.create(valid(solar_farm())).await.expect("stored");
+
+            let deleted = repo.delete(&created.id).await.expect("delete runs");
+            assert_eq!(deleted, created);
+            assert_eq!(repo.get(&created.id).await.expect("query runs"), None);
+        }
+
+        #[tokio::test]
+        async fn deleting_a_project_takes_its_holidays_with_it() {
+            let repo = repo().await;
+            let project = repo.create(valid(solar_farm())).await.expect("stored");
+            repo.add_holiday(
+                &project.id,
+                HolidayDraft::new(date("2026-06-26"), "Independence Day")
+                    .validate()
+                    .expect("valid holiday"),
+            )
+            .await
+            .expect("holiday is stored");
+
+            repo.delete(&project.id).await.expect("delete runs");
+
+            let (orphans,): (i64,) = sqlx::query_as("SELECT count(*) FROM project_holidays")
+                .fetch_one(repo.db().pool())
+                .await
+                .expect("query runs");
+            assert_eq!(orphans, 0, "ON DELETE CASCADE only works with foreign keys on");
+        }
+
+        #[tokio::test]
+        async fn deleting_something_that_is_gone_is_an_error() {
+            let repo = repo().await;
+            assert!(matches!(
+                repo.delete(&ProjectId::from("ghost")).await,
+                Err(AppError::NotFound { entity: "project", .. })
+            ));
+        }
+    }
+
+    mod holidays {
+        use super::*;
+
+        #[tokio::test]
+        async fn holidays_come_back_in_date_order() {
+            let repo = repo().await;
+            let project = repo.create(valid(solar_farm())).await.expect("stored");
+
+            for (day, name) in [
+                ("2026-06-26", "Independence Day"),
+                ("2026-03-29", "Martyrs' Day"),
+                ("2026-11-01", "All Saints' Day"),
+            ] {
+                repo.add_holiday(
+                    &project.id,
+                    HolidayDraft::new(date(day), name).validate().expect("valid holiday"),
+                )
+                .await
+                .expect("holiday is stored");
+            }
+
+            let stored = repo.holidays(&project.id).await.expect("query runs");
+            let dates: Vec<NaiveDate> = stored.iter().map(|h| h.date).collect();
+            assert_eq!(dates, [date("2026-03-29"), date("2026-06-26"), date("2026-11-01")]);
+        }
+
+        #[tokio::test]
+        async fn the_same_date_cannot_be_a_holiday_twice() {
+            let repo = repo().await;
+            let project = repo.create(valid(solar_farm())).await.expect("stored");
+            let independence = || {
+                HolidayDraft::new(date("2026-06-26"), "Independence Day")
+                    .validate()
+                    .expect("valid holiday")
+            };
+
+            repo.add_holiday(&project.id, independence()).await.expect("first one is fine");
+            let second = repo.add_holiday(&project.id, independence()).await;
+
+            match second {
+                Err(AppError::Conflict(message)) => assert!(message.contains("2026-06-26")),
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn two_projects_can_share_a_holiday_date() {
+            let repo = repo().await;
+            let first = repo.create(valid(solar_farm())).await.expect("stored");
+            let second = repo
+                .create(valid(ProjectDraft::new("Toamasina Port Logistics", date("2025-09-15"))))
+                .await
+                .expect("stored");
+
+            for project in [&first.id, &second.id] {
+                repo.add_holiday(
+                    project,
+                    HolidayDraft::new(date("2026-06-26"), "Independence Day")
+                        .validate()
+                        .expect("valid holiday"),
+                )
+                .await
+                .expect("each project keeps its own calendar");
+            }
+
+            assert_eq!(repo.holidays(&first.id).await.expect("query runs").len(), 1);
+            assert_eq!(repo.holidays(&second.id).await.expect("query runs").len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_holiday_needs_a_project_that_exists() {
+            let repo = repo().await;
+            let result = repo
+                .add_holiday(
+                    &ProjectId::from("ghost"),
+                    HolidayDraft::new(date("2026-06-26"), "Independence Day")
+                        .validate()
+                        .expect("valid holiday"),
+                )
+                .await;
+
+            assert!(matches!(result, Err(AppError::NotFound { entity: "project", .. })));
+        }
+
+        #[tokio::test]
+        async fn a_holiday_can_only_be_removed_through_its_own_project() {
+            let repo = repo().await;
+            let owner = repo.create(valid(solar_farm())).await.expect("stored");
+            let other = repo
+                .create(valid(ProjectDraft::new("Toamasina Port Logistics", date("2025-09-15"))))
+                .await
+                .expect("stored");
+
+            let holiday = repo
+                .add_holiday(
+                    &owner.id,
+                    HolidayDraft::new(date("2026-06-26"), "Independence Day")
+                        .validate()
+                        .expect("valid holiday"),
+                )
+                .await
+                .expect("holiday is stored");
+
+            let wrong_project = repo.remove_holiday(&other.id, &holiday.id).await;
+            assert!(matches!(wrong_project, Err(AppError::NotFound { .. })));
+            assert_eq!(repo.holidays(&owner.id).await.expect("query runs").len(), 1);
+
+            repo.remove_holiday(&owner.id, &holiday.id).await.expect("the owner can remove it");
+            assert!(repo.holidays(&owner.id).await.expect("query runs").is_empty());
+        }
+
+        #[tokio::test]
+        async fn the_holiday_set_is_what_the_work_calendar_consumes() {
+            let repo = repo().await;
+            let project = repo.create(valid(solar_farm())).await.expect("stored");
+            repo.add_holiday(
+                &project.id,
+                HolidayDraft::new(date("2026-09-07"), "Site shutdown")
+                    .validate()
+                    .expect("valid holiday"),
+            )
+            .await
+            .expect("holiday is stored");
+
+            let set: HolidaySet = repo.holiday_set(&project.id).await.expect("query runs");
+            assert!(set.contains(date("2026-09-07")));
+            assert!(!set.contains(date("2026-09-08")));
+        }
+    }
+
+    mod statistics {
+        use super::*;
+
+        #[tokio::test]
+        async fn portfolio_counts_match_the_overview_kpis() {
+            let repo = repo().await;
+            seed_portfolio(&repo).await;
+
+            let stats = repo.portfolio_stats().await.expect("query runs");
+            assert_eq!(stats, PortfolioStats { total: 4, active: 2, paused: 1, closed: 1 });
+        }
+
+        #[tokio::test]
+        async fn an_empty_portfolio_is_all_zeroes() {
+            let repo = repo().await;
+            assert_eq!(repo.portfolio_stats().await.expect("query runs"), PortfolioStats::default());
+        }
+
+        #[tokio::test]
+        async fn project_stats_subtract_the_projects_own_holidays() {
+            let repo = repo().await;
+            let project = repo.create(valid(solar_farm())).await.expect("stored");
+
+            // Two September working days off, plus one Saturday that changes
+            // nothing under a Mon–Fri calendar.
+            for day in ["2026-09-07", "2026-09-08", "2026-09-12"] {
+                repo.add_holiday(
+                    &project.id,
+                    HolidayDraft::new(date(day), "Site shutdown").validate().expect("valid"),
+                )
+                .await
+                .expect("holiday is stored");
+            }
+
+            let stats = repo.stats(&project.id, date("2026-09-15")).await.expect("query runs");
+
+            assert_eq!(stats.project_id, project.id);
+            assert_eq!(stats.month, YearMonth::new(2026, 9).expect("september"));
+            assert_eq!(stats.holiday_count, 3);
+            assert_eq!(stats.working_days_this_month, 20, "22 weekdays less two shutdown days");
+            assert_eq!(stats.working_minutes_this_month, 20 * 8 * 60);
+            assert_eq!(stats.duration.percent_elapsed, Some(44));
+        }
+
+        #[tokio::test]
+        async fn stats_for_a_project_that_is_gone_are_an_error() {
+            let repo = repo().await;
+            assert!(matches!(
+                repo.stats(&ProjectId::from("ghost"), date("2026-09-15")).await,
+                Err(AppError::NotFound { entity: "project", .. })
+            ));
+        }
+    }
+
+    mod audit {
+        use super::*;
+
+        #[tokio::test]
+        async fn every_change_to_a_project_is_logged_in_order() {
+            let repo = repo().await;
+            let created = repo.create(valid(solar_farm())).await.expect("stored");
+
+            let mut edit = solar_farm();
+            edit.status = ProjectStatus::Paused;
+            repo.update(&created.id, valid(edit)).await.expect("update runs");
+            repo.delete(&created.id).await.expect("delete runs");
+
+            let history =
+                repo.history("project", created.id.as_str()).await.expect("query runs");
+            let actions: Vec<AuditAction> = history.iter().map(|e| e.action).collect();
+            assert_eq!(
+                actions,
+                [AuditAction::Create, AuditAction::Update, AuditAction::Delete]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_deleted_project_is_still_recoverable_from_its_audit_snapshot() {
+            let repo = repo().await;
+            let created = repo.create(valid(solar_farm())).await.expect("stored");
+            repo.delete(&created.id).await.expect("delete runs");
+
+            let history = repo.history("project", created.id.as_str()).await.expect("query runs");
+            let deletion = history.last().expect("the delete is logged");
+            let detail = deletion.detail.as_deref().expect("a delete snapshots the row");
+            let recovered: Project =
+                serde_json::from_str(detail).expect("the snapshot is the project itself");
+
+            assert_eq!(recovered, created);
+        }
+
+        #[tokio::test]
+        async fn recent_activity_is_newest_first_and_respects_its_limit() {
+            let repo = repo().await;
+            seed_portfolio(&repo).await;
+
+            let recent = repo.recent_activity(2).await.expect("query runs");
+            assert_eq!(recent.len(), 2);
+            assert!(recent[0].id > recent[1].id);
+
+            let all = repo.recent_activity(50).await.expect("query runs");
+            assert_eq!(all.len(), 4, "one create per seeded project");
+            assert!(all.iter().all(|e| e.action == AuditAction::Create));
+        }
+
+        #[tokio::test]
+        async fn holiday_changes_are_logged_against_the_holiday() {
+            let repo = repo().await;
+            let project = repo.create(valid(solar_farm())).await.expect("stored");
+            let holiday = repo
+                .add_holiday(
+                    &project.id,
+                    HolidayDraft::new(date("2026-06-26"), "Independence Day")
+                        .validate()
+                        .expect("valid holiday"),
+                )
+                .await
+                .expect("holiday is stored");
+            repo.remove_holiday(&project.id, &holiday.id).await.expect("removal runs");
+
+            let history = repo
+                .history("project_holiday", holiday.id.as_str())
+                .await
+                .expect("query runs");
+            let actions: Vec<AuditAction> = history.iter().map(|e| e.action).collect();
+            assert_eq!(actions, [AuditAction::Create, AuditAction::Delete]);
+        }
+    }
+}

@@ -4,7 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Scaffold only: a Tauri v2 + React/TS/Vite shell that opens one empty window. No domain code, no database, no migrations, no tests yet. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
+Tauri v2 + React/TS/Vite shell. The **projects** slice of the backend is built and tested; everything else (employees, contracts, leave, payroll, and the whole front end) is still to come. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
+
+Rust layout under `src-tauri/src/`:
+
+| Path | Holds |
+| --- | --- |
+| `domain/calendar.rs` | `WeekdayMask`, `DayLength` (minutes), `YearMonth`, `HolidaySet`, `WorkCalendar` — working-day counting |
+| `domain/project.rs` | `Project`, `ProjectStatus`, `ProjectDraft` → `ValidProject`, `Holiday`, `ProjectFilter`, `DurationProgress`, `ProjectStats`, `PortfolioStats` |
+| `domain/mod.rs` | `ValidationError`/`ValidationErrors`, the `id_type!` newtype macro |
+| `repo/mod.rs` | `ProjectRepository` and `ActivityRepository` traits, `AuditEntry` |
+| `repo/sqlite.rs` | the SQLite implementation; every write is a transaction that also appends its audit row |
+| `db.rs` | pool setup, pragmas, embedded migrations, `Db::in_memory()` for tests |
+| `commands.rs` | `AppState` (where validation happens) plus one-line `#[tauri::command]` wrappers |
+| `error.rs` | `AppError`, serialised to the front end as `{ kind, message, fields }` |
+| `migrations/0001_init.sql` | `projects`, `project_holidays`, `audit_log` |
+
+Conventions worth copying when the next slice lands: drafts are validated into a `Valid*` newtype that the repository is the only consumer of, so nothing invalid can reach the DB by another route; validation collects **every** failing field rather than stopping at the first; and `as_of` dates are passed in, never read from the clock inside the domain, so stats are reproducible in a test.
 
 Pinned by the scaffold: Tauri 2.11.5, React 19, Vite 7, TypeScript 5.8, Rust edition 2021. Package manager is **npm** (bun is not installed on this machine).
 
@@ -17,8 +33,9 @@ npm run build            # frontend only: tsc && vite build
 npm run tauri build      # packaged installers (needs signing setup, see README)
 
 cd src-tauri && cargo check   # type-check Rust without linking
-cd src-tauri && cargo test    # domain-layer tests (none exist yet)
-cd src-tauri && cargo test payroll::tests::unpaid_leave   # single test by path
+cd src-tauri && cargo test    # domain, repository and command tests
+cd src-tauri && cargo test domain::project    # one module
+cd src-tauri && cargo clippy --all-targets    # clean as of the projects slice
 ```
 
 Notes that cost time if unknown:
