@@ -41,6 +41,7 @@ export default function App() {
     active: 0,
     paused: 0,
     closed: 0,
+    people: 0,
   });
   const [activity, setActivity] = useState<AuditEntry[]>([]);
   const [status, setStatus] = useState<ProjectStatus | null>(null);

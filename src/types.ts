@@ -91,6 +91,8 @@ export interface DurationProgress {
 export interface ProjectStats {
   projectId: string;
   status: ProjectStatus;
+  /** People on this project. */
+  headcount: number;
   asOf: IsoDate;
   month: YearMonth;
   duration: DurationProgress;
@@ -104,6 +106,58 @@ export interface PortfolioStats {
   active: number;
   paused: number;
   closed: number;
+  /** Everyone on the books, across every project. */
+  people: number;
+}
+
+export interface Employee {
+  id: string;
+  projectId: string;
+  firstName: string;
+  lastName: string;
+  role: string;
+  email: string | null;
+  phone: string | null;
+  address: string | null;
+  /** Digits only — spaces are stripped by the backend. */
+  cin: string | null;
+  birthDate: IsoDate | null;
+  hireDate: IsoDate;
+  bankAccount: string | null;
+  emergencyContact: string | null;
+  createdAt: IsoInstant;
+  updatedAt: IsoInstant;
+}
+
+export interface EmployeeDraft {
+  firstName: string;
+  lastName: string;
+  role: string;
+  email: string | null;
+  phone: string | null;
+  address: string | null;
+  cin: string | null;
+  birthDate: IsoDate | null;
+  hireDate: IsoDate;
+  bankAccount: string | null;
+  emergencyContact: string | null;
+}
+
+export interface EmployeeFilter {
+  /** `null` lists everyone, across every project. */
+  project: string | null;
+  query: string | null;
+}
+
+export interface EmployeeStats {
+  employeeId: string;
+  projectId: string;
+  asOf: IsoDate;
+  month: YearMonth;
+  age: number | null;
+  monthsOfService: number;
+  yearsOfService: number;
+  monthsWorkedThisYear: number;
 }
 
 export type AuditAction = "create" | "update" | "delete";

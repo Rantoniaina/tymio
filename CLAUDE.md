@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Tauri v2 + React/TS/Vite shell. The **projects** slice of the backend is built and tested; everything else (employees, contracts, leave, payroll, and the whole front end) is still to come. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
+Tauri v2 + React/TS/Vite shell. The **projects** slice is built end to end (Rust + UI + e2e); the **employees** backend is built and tested with no UI yet. Contracts, leave and payroll are still to come. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
 
 Front end under `src/`: `App.tsx` (the project-picker screen), `components/` (card, form modal, confirm dialog, activity panel, toast), `ipc.ts` (the only place that calls `invoke`), `types.ts` (hand-mirrored from the Rust structs), `format.ts` (dd/mm/yyyy dates, space-separated thousands, weekday-mask helpers), `styles.css` (design tokens from the mockup).
 
@@ -14,13 +14,15 @@ Rust layout under `src-tauri/src/`:
 | --- | --- |
 | `domain/calendar.rs` | `WeekdayMask`, `DayLength` (minutes), `YearMonth`, `HolidaySet`, `WorkCalendar` — working-day counting |
 | `domain/project.rs` | `Project`, `ProjectStatus`, `ProjectDraft` → `ValidProject`, `Holiday`, `ProjectFilter`, `DurationProgress`, `ProjectStats`, `PortfolioStats` |
+| `domain/employee.rs` | `Employee`, `EmployeeDraft` → `ValidEmployee`, `EmployeeFilter`, `EmployeeStats`; age, whole-months service, and `months_worked_in` (the mockup's accrual driver) |
 | `domain/mod.rs` | `ValidationError`/`ValidationErrors`, the `id_type!` newtype macro |
-| `repo/mod.rs` | `ProjectRepository` and `ActivityRepository` traits, `AuditEntry` |
-| `repo/sqlite.rs` | the SQLite implementation; every write is a transaction that also appends its audit row |
+| `repo/mod.rs` | `ProjectRepository`, `EmployeeRepository` and `ActivityRepository` traits, `AuditEntry` |
+| `repo/sqlite.rs` | `SqliteProjectRepository`, `SqliteEmployeeRepository`, `SqliteActivityRepository` — **one struct per aggregate**, because several traits on one type make every `create`/`get`/`list` call ambiguous. Every write is a transaction that also appends its audit row |
 | `db.rs` | pool setup, pragmas, embedded migrations, `Db::in_memory()` for tests |
-| `commands.rs` | `AppState` (where validation happens) plus one-line `#[tauri::command]` wrappers |
+| `commands.rs` | `AppState::new(db)` builds one repository per trait; validation happens here, then one-line `#[tauri::command]` wrappers |
 | `error.rs` | `AppError`, serialised to the front end as `{ kind, message, fields }` |
 | `migrations/0001_init.sql` | `projects`, `project_holidays`, `audit_log` |
+| `migrations/0002_employees.sql` | `employees` — CIN unique where recorded, cascade from the project |
 
 ### Testing
 

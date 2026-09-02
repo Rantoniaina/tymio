@@ -11,6 +11,10 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   AuditEntry,
+  Employee,
+  EmployeeDraft,
+  EmployeeFilter,
+  EmployeeStats,
   Holiday,
   HolidayDraft,
   PortfolioStats,
@@ -118,4 +122,22 @@ export const api = {
 
   recentActivity: (limit: number | null = null) =>
     call<AuditEntry[]>("recent_activity", { limit }),
+
+  // Employees. No screen calls these yet — the employees view is the next
+  // slice — but the commands and their shapes are in place.
+  listEmployees: (filter: EmployeeFilter | null = null) =>
+    call<Employee[]>("list_employees", { filter }),
+
+  getEmployee: (id: string) => call<Employee | null>("get_employee", { id }),
+
+  createEmployee: (project: string, draft: EmployeeDraft) =>
+    call<Employee>("create_employee", { project, draft }),
+
+  updateEmployee: (id: string, draft: EmployeeDraft) =>
+    call<Employee>("update_employee", { id, draft }),
+
+  deleteEmployee: (id: string) => call<Employee>("delete_employee", { id }),
+
+  employeeStats: (id: string, asOf: IsoDate | null = null) =>
+    call<EmployeeStats>("employee_stats", { id, asOf }),
 };
