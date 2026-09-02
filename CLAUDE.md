@@ -4,12 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Tauri v2 + React/TS/Vite shell. The **projects** and **employees** slices are built end to end (Rust + UI + Playwright); the **time & attendance** backend is built and tested with no UI yet. Contracts, leave and payroll are still to come — the nav and the employee-file tabs for those render a `ComingSoon` panel saying which slice they wait on. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
+Tauri v2 + React/TS/Vite shell. The **projects**, **employees** and **time & attendance** slices are built end to end (Rust + UI + Playwright). Contracts, leave and payroll are still to come — the nav and the employee-file tabs for those render a `ComingSoon` panel saying which slice they wait on. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
 
 Front end under `src/`:
 
 - `App.tsx` — two screens: pick a project, then work inside it. Owns the toast.
-- `screens/` — `ProjectsScreen` (the picker), `Workspace` (rail + topbar + view routing), `EmployeesView` (the table), `EmployeeFile` (header, tabs, detail panels).
+- `screens/` — `ProjectsScreen` (the picker), `Workspace` (rail + topbar + view routing), `EmployeesView` (the table), `EmployeeFile` (header, tabs, detail panels), `AttendanceView` (the monthly grid).
+
+**The attendance grid holds its own input state, and only resets when the parent remounts it** via a `syncKey` (a refill, a cleared row, a new month). Re-syncing from the server on every save would wipe whatever the user had already typed into the next box — an in-flight save must never overwrite live input.
 - `components/` — project card, both form modals, confirm dialog, activity panel, avatar, detail list, `ComingSoon`, toast.
 - `ipc.ts` (the only place that calls `invoke`), `types.ts` (hand-mirrored from the Rust structs), `format.ts` (dd/mm/yyyy dates, space-separated thousands, month/service/weekday-mask helpers), `styles.css` (design tokens from the mockup).
 
@@ -111,7 +113,7 @@ The mockup encodes concrete business rules that exist nowhere else in prose. Pre
 
 **Time & attendance**: per employee, per month — days worked, hours worked, overtime hours. Defaults come from the project's standard schedule ("Fill from standard schedule"), then are manually adjustable. This reconciles the README's "derived from a work calendar" with the mockup's editable grid: the calendar seeds the numbers, the user can override them.
 
-*Built.* Days are stored in **half-days** and hours in **minutes** — never floats. Recording a month is an upsert on `(employee, period)`, not a create/update pair, because that is what the grid does. Seeding clips to the part of the month a person was actually employed for, carries existing overtime over (the calendar cannot know it), and has a `leave` parameter that the leave slice fills in — it is passed zero for now. `source` (`schedule` | `manual`) records which of the two last wrote each row.
+*Built, end to end.* Days are stored in **half-days** and hours in **minutes** — never floats. Recording a month is an upsert on `(employee, period)`, not a create/update pair, because that is what the grid does. Seeding clips to the part of the month a person was actually employed for, carries existing overtime over (the calendar cannot know it), and has a `leave` parameter that the leave slice fills in — it is passed zero for now. `source` (`schedule` | `manual`) records which of the two last wrote each row.
 
 **Contract fields**: type, rate, start, end, weekly hours (40), probation months (3), annual grant days, monthly accrual days.
 

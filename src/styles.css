@@ -1251,3 +1251,116 @@ select:focus-visible {
 .modal--wide {
   max-width: 680px;
 }
+
+/* ---------- attendance grid ---------- */
+
+.toolbar__prose {
+  color: var(--muted);
+  max-width: 560px;
+  text-wrap: pretty;
+  margin: 0;
+  font-size: 13px;
+}
+
+.table--attendance .table__head,
+.table--attendance .table__row {
+  grid-template-columns: 1.9fr 1fr 1.35fr 1.35fr 1.2fr 110px;
+}
+
+.table__row--invalid {
+  background: #fdf6f4;
+  border-bottom-color: transparent;
+}
+
+.table__error {
+  padding: 0 20px 12px;
+  color: var(--red);
+  font-size: 12.5px;
+  background: #fdf6f4;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.table__total {
+  background: #faf8f5;
+  font-family: var(--mono);
+  font-size: 13.5px;
+  border-bottom: none;
+}
+
+.table__total-label {
+  font-family: var(--sans);
+  font-weight: 600;
+}
+
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stepper__button {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border: 1px solid var(--line-input);
+  background: var(--surface);
+  border-radius: 7px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.stepper__button:hover {
+  border-color: var(--muted-soft);
+}
+
+.stepper__button:focus-visible,
+.stepper__input:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.stepper__input {
+  width: 66px;
+  border: 1px solid var(--line-input);
+  background: var(--surface);
+  border-radius: 7px;
+  padding: 5px 8px;
+  font-family: var(--mono);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* The spinners fight the steppers for space and do the same job. */
+.stepper__input::-webkit-outer-spin-button,
+.stepper__input::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+.stepper__input[type="number"] {
+  appearance: textfield;
+}
+
+.source {
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.source--schedule {
+  background: var(--teal-tint);
+  color: var(--teal-deep);
+}
+
+.source--manual {
+  background: var(--bronze-tint);
+  color: var(--bronze-deep);
+}
+
+.cell-muted {
+  color: var(--muted-faint);
+  font-size: 12.5px;
+}
