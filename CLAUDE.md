@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Tauri v2 + React/TS/Vite shell. The **projects**, **employees** and **time & attendance** slices are built end to end (Rust + UI + Playwright). Contracts, leave and payroll are still to come — the nav and the employee-file tabs for those render a `ComingSoon` panel saying which slice they wait on. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
+Tauri v2 + React/TS/Vite shell. The **projects**, **employees** and **time & attendance** slices are built end to end (Rust + UI + Playwright); the **contracts** backend is built and tested with no UI yet. Leave and payroll are still to come — the nav and the employee-file tabs for those render a `ComingSoon` panel saying which slice they wait on. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
 
 Front end under `src/`:
 
@@ -24,9 +24,10 @@ Rust layout under `src-tauri/src/`:
 | `domain/calendar.rs` | `WeekdayMask`, `DayLength` (minutes), `YearMonth`, `HolidaySet`, `WorkCalendar` — working-day counting |
 | `domain/project.rs` | `Project`, `ProjectStatus`, `ProjectDraft` → `ValidProject`, `Holiday`, `ProjectFilter`, `DurationProgress`, `ProjectStats`, `PortfolioStats` |
 | `domain/employee.rs` | `Employee`, `EmployeeDraft` → `ValidEmployee`, `EmployeeFilter`, `EmployeeStats`; age, whole-months service, and `months_worked_in` (the mockup's accrual driver) |
+| `domain/contract.rs` | `PayType`, `Rate` (scale 4, serialised as a string), `WeeklyHours`, `LeaveDays`, `ContractTerms` with the ÷26 / ÷173 / ÷8 conversions, `ContractDraft` → `ValidContract`, `round_ariary` |
 | `domain/attendance.rs` | `WorkedDays` (half-days), `WorkedTime` (minutes), `AttendanceDraft` → `ValidAttendance`, `AttendanceSheet`/`Totals`, and `from_standard_schedule` — the "Fill from standard schedule" rule |
 | `domain/mod.rs` | `ValidationError`/`ValidationErrors`, the `id_type!` newtype macro |
-| `repo/mod.rs` | `ProjectRepository`, `EmployeeRepository`, `AttendanceRepository` and `ActivityRepository` traits, `AuditEntry` |
+| `repo/mod.rs` | `ProjectRepository`, `EmployeeRepository`, `AttendanceRepository`, `ContractRepository` and `ActivityRepository` traits, `AuditEntry` |
 | `repo/sqlite.rs` | `SqliteProjectRepository`, `SqliteEmployeeRepository`, `SqliteActivityRepository` — **one struct per aggregate**, because several traits on one type make every `create`/`get`/`list` call ambiguous. Every write is a transaction that also appends its audit row |
 | `db.rs` | pool setup, pragmas, embedded migrations, `Db::in_memory()` for tests |
 | `commands.rs` | `AppState::new(db)` builds one repository per trait; validation happens here, then one-line `#[tauri::command]` wrappers |
@@ -34,6 +35,7 @@ Rust layout under `src-tauri/src/`:
 | `migrations/0001_init.sql` | `projects`, `project_holidays`, `audit_log` |
 | `migrations/0002_employees.sql` | `employees` — CIN unique where recorded, cascade from the project |
 | `migrations/0003_attendance.sql` | `attendance` — one row per `(employee, period)`, days in half-days, hours in minutes |
+| `migrations/0004_contracts.sql` | `contracts` — effective-dated versions, rate at scale 4 as an integer |
 
 ### Testing
 
@@ -84,7 +86,7 @@ A single-user desktop HR app. Everything is scoped to a **project**: create a pr
 These are settled and load-bearing. `README.md` has the full rationale; the short version:
 
 - **No floats for money, anywhere.** `rust_decimal` in Rust, integers in storage.
-- **Contracts are effective-dated versions, never updated in place.** A March payroll run must still reproduce identically in December after two raises.
+- **Contracts are effective-dated versions, never updated in place.** A March payroll run must still reproduce identically in December after two raises. *Built.* `amend` writes a new version and closes the previous window the day before; there is no `update`. Two date pairs, meaning different things: `valid_from`/`valid_to` is the **version** window, `start_date`/`end_date` the contract's own duration. `discard_latest` is the only removal, and it reopens the version it superseded. The repository enforces the no-overlap invariant itself — SQLite has no exclusion constraint.
 - **Payroll runs snapshot their inputs, then lock.** Each item records the contract version and the day/hour/leave counts it used.
 - **Leave balance is an append-only ledger, never a mutable counter.** Accrual entries are keyed `(employee, kind, period)` with a unique constraint so re-running accrual is a no-op. See the caveat under "Mockup logic is illustrative" below.
 - **Civil dates (`chrono::NaiveDate`), never UTC timestamps**, for leave, contracts, and payroll periods.
@@ -116,6 +118,8 @@ The mockup encodes concrete business rules that exist nowhere else in prose. Pre
 *Built, end to end.* Days are stored in **half-days** and hours in **minutes** — never floats. Recording a month is an upsert on `(employee, period)`, not a create/update pair, because that is what the grid does. Seeding clips to the part of the month a person was actually employed for, carries existing overtime over (the calendar cannot know it), and has a `leave` parameter that the leave slice fills in — it is passed zero for now. `source` (`schedule` | `manual`) records which of the two last wrote each row.
 
 **Contract fields**: type, rate, start, end, weekly hours (40), probation months (3), annual grant days, monthly accrual days.
+
+*Built.* Rates are `rust_decimal` at scale 4, stored as a scale-4 integer, and cross the IPC boundary as **decimal strings** — a JSON number would lose `123456.7891`. The basis conversions are fixed conventions (÷26, ÷173, ÷8), deliberately not derived from the project's own day length, and they return **unrounded** decimals: `round_ariary` is applied once, at the final amount. Leave policy is two independent fields (grant *and* accrual, either/both/neither), which follows the mockup rather than the README's single `accrual_type` enum.
 
 **Project fields**: name, client, location, status (Active | Paused | Closed), start, end.
 

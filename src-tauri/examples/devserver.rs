@@ -188,6 +188,29 @@ fn dispatch(
         "employee_attendance" => {
             encode(runtime.block_on(state.employee_attendance(required(args, "employee")?))?)
         }
+        "current_contract" => encode(
+            runtime.block_on(
+                state.current_contract(required(args, "employee")?, arg(args, "asOf")?),
+            )?,
+        ),
+        "contract_history" => {
+            encode(runtime.block_on(state.contract_history(required(args, "employee")?))?)
+        }
+        "amend_contract" => encode(
+            runtime.block_on(
+                state.amend_contract(required(args, "employee")?, required(args, "draft")?),
+            )?,
+        ),
+        "discard_latest_contract" => {
+            encode(runtime.block_on(state.discard_latest_contract(required(args, "employee")?))?)
+        }
+        "contracts_ending" => encode(
+            runtime.block_on(state.contracts_ending(
+                required(args, "project")?,
+                arg(args, "from")?,
+                arg(args, "withinDays")?,
+            ))?,
+        ),
         "employee_stats" => encode(
             runtime.block_on(state.employee_stats(required(args, "id")?, arg(args, "asOf")?))?,
         ),

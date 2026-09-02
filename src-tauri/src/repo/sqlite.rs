@@ -21,20 +21,28 @@ use crate::domain::attendance::{
     WorkedDays, WorkedTime,
 };
 use crate::domain::calendar::{DayLength, WeekdayMask, WorkCalendar, YearMonth};
+use crate::domain::contract::{
+    Contract, ContractId, ContractTerms, LeaveDays, PayType, Rate, ValidContract, WeeklyHours,
+};
 use crate::domain::employee::{
     Employee, EmployeeFilter, EmployeeId, EmployeeStats, ValidEmployee,
 };
 use crate::error::{AppError, Result};
 
 use super::{
-    ActivityRepository, AttendanceRepository, AuditAction, AuditEntry, EmployeeRepository,
-    ProjectRepository,
+    ActivityRepository, AttendanceRepository, AuditAction, AuditEntry, ContractRepository,
+    EmployeeRepository, ProjectRepository,
 };
 
 const PROJECT_ENTITY: &str = "project";
 const HOLIDAY_ENTITY: &str = "project_holiday";
 const EMPLOYEE_ENTITY: &str = "employee";
 const ATTENDANCE_ENTITY: &str = "attendance";
+const CONTRACT_ENTITY: &str = "contract";
+
+const CONTRACT_COLUMNS: &str = "id, employee_id, valid_from, valid_to, pay_type, rate_scaled, \
+                                start_date, end_date, weekly_minutes, probation_months, \
+                                annual_grant_halves, monthly_accrual_halves, created_at";
 
 const ATTENDANCE_COLUMNS: &str = "id, employee_id, period, days_worked_halves, \
                                   hours_worked_minutes, overtime_minutes, source, \
@@ -85,6 +93,11 @@ repository! {
 repository! {
     /// Days, hours and overtime, per employee per month.
     SqliteAttendanceRepository
+}
+
+repository! {
+    /// Contracts, as effective-dated versions.
+    SqliteContractRepository
 }
 
 repository! {
@@ -213,6 +226,44 @@ fn attendance_from_row(row: &SqliteRow) -> Result<AttendanceEntry> {
         source,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn contract_from_row(row: &SqliteRow) -> Result<Contract> {
+    let id: String = row.try_get("id")?;
+    let corrupt = |detail: String| AppError::CorruptRow {
+        entity: CONTRACT_ENTITY,
+        id: id.clone(),
+        detail,
+    };
+
+    let pay_type: String = row.try_get("pay_type")?;
+    let pay_type: PayType = pay_type.parse().map_err(|e: crate::domain::contract::ContractError| corrupt(e.to_string()))?;
+
+    let rate: i64 = row.try_get("rate_scaled")?;
+    let weekly: i64 = row.try_get("weekly_minutes")?;
+    let probation: i64 = row.try_get("probation_months")?;
+    let grant: i64 = row.try_get("annual_grant_halves")?;
+    let accrual: i64 = row.try_get("monthly_accrual_halves")?;
+
+    Ok(Contract {
+        id: ContractId::from(id.clone()),
+        employee_id: EmployeeId::from(row.try_get::<String, _>("employee_id")?),
+        valid_from: row.try_get("valid_from")?,
+        valid_to: row.try_get("valid_to")?,
+        terms: ContractTerms {
+            pay_type,
+            rate: Rate::from_scaled(rate).map_err(|e| corrupt(e.to_string()))?,
+            start: row.try_get("start_date")?,
+            end: row.try_get("end_date")?,
+            weekly_hours: WeeklyHours::from_minutes(weekly).map_err(|e| corrupt(e.to_string()))?,
+            probation_months: u8::try_from(probation)
+                .map_err(|_| corrupt(format!("probation of {probation} months")))?,
+            annual_grant: LeaveDays::from_halves(grant).map_err(|e| corrupt(e.to_string()))?,
+            monthly_accrual: LeaveDays::from_halves(accrual)
+                .map_err(|e| corrupt(e.to_string()))?,
+        },
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -931,6 +982,208 @@ impl AttendanceRepository for SqliteAttendanceRepository {
         .await?;
 
         rows.iter().map(attendance_from_row).collect()
+    }
+}
+
+#[async_trait]
+impl ContractRepository for SqliteContractRepository {
+    async fn current(&self, employee: &EmployeeId, as_of: NaiveDate) -> Result<Option<Contract>> {
+        // The version whose window contains the date. `valid_to` is inclusive
+        // and NULL means "still in force".
+        let row = sqlx::query(&format!(
+            "SELECT {CONTRACT_COLUMNS} FROM contracts \
+             WHERE employee_id = ?1 AND valid_from <= ?2 \
+               AND (valid_to IS NULL OR valid_to >= ?2) \
+             ORDER BY valid_from DESC LIMIT 1"
+        ))
+        .bind(employee.as_str())
+        .bind(as_of)
+        .fetch_optional(self.db.pool())
+        .await?;
+
+        row.as_ref().map(contract_from_row).transpose()
+    }
+
+    async fn latest(&self, employee: &EmployeeId) -> Result<Option<Contract>> {
+        let row = sqlx::query(&format!(
+            "SELECT {CONTRACT_COLUMNS} FROM contracts WHERE employee_id = ?1 \
+             ORDER BY valid_from DESC LIMIT 1"
+        ))
+        .bind(employee.as_str())
+        .fetch_optional(self.db.pool())
+        .await?;
+
+        row.as_ref().map(contract_from_row).transpose()
+    }
+
+    async fn history(&self, employee: &EmployeeId) -> Result<Vec<Contract>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {CONTRACT_COLUMNS} FROM contracts WHERE employee_id = ?1 \
+             ORDER BY valid_from DESC"
+        ))
+        .bind(employee.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+
+        rows.iter().map(contract_from_row).collect()
+    }
+
+    async fn amend(&self, employee: &EmployeeId, contract: ValidContract) -> Result<Contract> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM employees WHERE id = ?1")
+            .bind(employee.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::not_found(EMPLOYEE_ENTITY, employee));
+        }
+
+        // Two versions must never cover the same date, and SQLite has no
+        // exclusion constraint to lean on — so the invariant is enforced here,
+        // whatever the caller validated. Superseding a version on or before
+        // its own start date would close its window backwards.
+        let in_force: Option<(NaiveDate,)> = sqlx::query_as(
+            "SELECT valid_from FROM contracts WHERE employee_id = ?1 AND valid_to IS NULL",
+        )
+        .bind(employee.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some((current_from,)) = in_force {
+            if contract.effective_from() <= current_from {
+                return Err(AppError::Conflict(format!(
+                    "new terms must begin after {current_from}, when the version they replace started"
+                )));
+            }
+        }
+
+        // Close whatever is in force the day before the new terms begin.
+        let closes_on = contract
+            .effective_from()
+            .pred_opt()
+            .ok_or_else(|| AppError::Conflict("that date is too early to amend from".into()))?;
+        sqlx::query(
+            "UPDATE contracts SET valid_to = ?2 WHERE employee_id = ?1 AND valid_to IS NULL",
+        )
+        .bind(employee.as_str())
+        .bind(closes_on)
+        .execute(&mut *tx)
+        .await?;
+
+        let stored = contract.into_contract(ContractId::new(), employee.clone(), now);
+        let terms = stored.terms;
+
+        sqlx::query(
+            "INSERT INTO contracts (id, employee_id, valid_from, valid_to, pay_type, \
+             rate_scaled, start_date, end_date, weekly_minutes, probation_months, \
+             annual_grant_halves, monthly_accrual_halves, created_at) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        )
+        .bind(stored.id.as_str())
+        .bind(stored.employee_id.as_str())
+        .bind(stored.valid_from)
+        .bind(terms.pay_type.as_str())
+        .bind(terms.rate.to_scaled())
+        .bind(terms.start)
+        .bind(terms.end)
+        .bind(i64::from(terms.weekly_hours.minutes()))
+        .bind(i64::from(terms.probation_months))
+        .bind(i64::from(terms.annual_grant.halves()))
+        .bind(i64::from(terms.monthly_accrual.halves()))
+        .bind(stored.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            AppError::from_sqlx(e, || {
+                format!("a version of this contract already begins on {}", stored.valid_from)
+            })
+        })?;
+
+        // Always a create: a version is written once and never edited.
+        record(
+            &mut tx,
+            now,
+            CONTRACT_ENTITY,
+            stored.id.as_str(),
+            AuditAction::Create,
+            snapshot(&stored),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(stored)
+    }
+
+    async fn discard_latest(&self, employee: &EmployeeId) -> Result<Contract> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {CONTRACT_COLUMNS} FROM contracts WHERE employee_id = ?1 \
+             ORDER BY valid_from DESC LIMIT 1"
+        ))
+        .bind(employee.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found(CONTRACT_ENTITY, employee))?;
+        let discarded = contract_from_row(&row)?;
+
+        sqlx::query("DELETE FROM contracts WHERE id = ?1")
+            .bind(discarded.id.as_str())
+            .execute(&mut *tx)
+            .await?;
+
+        // Reopen the version this one had closed, so the employee is not left
+        // with a contract that stops mid-history.
+        sqlx::query(
+            "UPDATE contracts SET valid_to = NULL WHERE employee_id = ?1 AND valid_to = ?2",
+        )
+        .bind(employee.as_str())
+        .bind(discarded.valid_from.pred_opt())
+        .execute(&mut *tx)
+        .await?;
+
+        record(
+            &mut tx,
+            now,
+            CONTRACT_ENTITY,
+            discarded.id.as_str(),
+            AuditAction::Delete,
+            snapshot(&discarded),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(discarded)
+    }
+
+    async fn ending_between(
+        &self,
+        project: &ProjectId,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<Contract>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {} FROM contracts c \
+             JOIN employees e ON e.id = c.employee_id \
+             WHERE e.project_id = ?1 AND c.valid_to IS NULL \
+               AND c.end_date IS NOT NULL AND c.end_date BETWEEN ?2 AND ?3 \
+             ORDER BY c.end_date ASC",
+            CONTRACT_COLUMNS
+                .split(", ")
+                .map(|column| format!("c.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .bind(project.as_str())
+        .bind(from)
+        .bind(to)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        rows.iter().map(contract_from_row).collect()
     }
 }
 
@@ -2263,6 +2516,424 @@ mod tests {
                 actions,
                 [AuditAction::Create, AuditAction::Update, AuditAction::Delete]
             );
+        }
+    }
+
+    mod contracts {
+        use super::*;
+
+        use crate::domain::contract::{ContractContext, ContractDraft, PayType};
+        use crate::domain::employee::EmployeeDraft;
+
+        const HIRED: &str = "2026-02-01";
+
+        async fn employed() -> (
+            SqliteProjectRepository,
+            SqliteEmployeeRepository,
+            SqliteContractRepository,
+            SqliteActivityRepository,
+            Project,
+            Employee,
+        ) {
+            let db = Db::in_memory().await.expect("in-memory database opens");
+            let projects = SqliteProjectRepository::new(db.clone());
+            let employees = SqliteEmployeeRepository::new(db.clone());
+            let contracts = SqliteContractRepository::new(db.clone());
+            let log = SqliteActivityRepository::new(db);
+
+            let project = projects.create(valid(solar_farm())).await.expect("stored");
+            let employee = employees
+                .create(
+                    &project.id,
+                    EmployeeDraft::new("Rakoto", "Randrianasolo", "Site supervisor", date(HIRED))
+                        .validate()
+                        .expect("valid"),
+                )
+                .await
+                .expect("hired");
+
+            (projects, employees, contracts, log, project, employee)
+        }
+
+        /// A validated version, checked against whatever is already in force.
+        async fn version(
+            contracts: &SqliteContractRepository,
+            employee: &EmployeeId,
+            draft: ContractDraft,
+        ) -> ValidContract {
+            let context = match contracts.latest(employee).await.expect("query runs") {
+                Some(current) => ContractContext::amending(date(HIRED), &current),
+                None => ContractContext::first(date(HIRED)),
+            };
+            draft.validate(context).expect("valid draft")
+        }
+
+        fn monthly(rate: &str, from: &str) -> ContractDraft {
+            ContractDraft::monthly(rate, date(from))
+        }
+
+        #[tokio::test]
+        async fn a_first_contract_is_open_ended_and_reads_back_identically() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            let draft = version(&contracts, &employee.id, monthly("3200000", HIRED)).await;
+
+            let stored = contracts.amend(&employee.id, draft).await.expect("written");
+
+            assert!(stored.is_current());
+            assert_eq!(stored.valid_from, date(HIRED));
+            assert_eq!(stored.terms.rate.to_string(), "3200000.0000");
+            assert_eq!(stored.terms.pay_type, PayType::Monthly);
+
+            let current = contracts
+                .current(&employee.id, date("2026-06-15"))
+                .await
+                .expect("query runs")
+                .expect("in force");
+            assert_eq!(current, stored);
+        }
+
+        #[tokio::test]
+        async fn every_pay_basis_and_the_full_leave_policy_survive_the_round_trip() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            let mut draft = monthly("14500.5000", HIRED);
+            draft.pay_type = PayType::Hourly;
+            draft.end = Some(date("2026-10-31"));
+            draft.weekly_minutes = Some(37 * 60 + 30);
+            draft.probation_months = 6;
+            draft.annual_grant_halves = 24;
+            draft.monthly_accrual_halves = 3;
+
+            let written = contracts
+                .amend(&employee.id, version(&contracts, &employee.id, draft).await)
+                .await
+                .expect("written");
+            let read = contracts
+                .latest(&employee.id)
+                .await
+                .expect("query runs")
+                .expect("it is there");
+
+            assert_eq!(read, written);
+            assert_eq!(read.terms.pay_type, PayType::Hourly);
+            assert_eq!(read.terms.rate.to_string(), "14500.5000");
+            assert_eq!(read.terms.end, Some(date("2026-10-31")));
+            assert_eq!(read.terms.weekly_hours.to_string(), "37 h 30");
+            assert_eq!(read.terms.probation_months, 6);
+            assert_eq!(read.terms.annual_grant.to_string(), "12");
+            assert_eq!(read.terms.monthly_accrual.to_string(), "1.5");
+        }
+
+        #[tokio::test]
+        async fn a_raise_closes_the_old_version_the_day_before_the_new_one() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            contracts
+                .amend(&employee.id, version(&contracts, &employee.id, monthly("3200000", HIRED)).await)
+                .await
+                .expect("first");
+            contracts
+                .amend(
+                    &employee.id,
+                    version(&contracts, &employee.id, monthly("3600000", "2026-06-01")).await,
+                )
+                .await
+                .expect("raise");
+
+            let history = contracts.history(&employee.id).await.expect("query runs");
+            assert_eq!(history.len(), 2);
+            // Newest first.
+            assert_eq!(history[0].valid_from, date("2026-06-01"));
+            assert_eq!(history[0].valid_to, None);
+            assert_eq!(history[1].valid_from, date(HIRED));
+            assert_eq!(history[1].valid_to, Some(date("2026-05-31")));
+        }
+
+        #[tokio::test]
+        async fn march_still_reproduces_after_two_raises() {
+            // The reason contracts are versioned at all.
+            let (_, _, contracts, _, _, employee) = employed().await;
+            for (rate, from) in
+                [("3200000", HIRED), ("3600000", "2026-06-01"), ("4000000", "2026-09-01")]
+            {
+                contracts
+                    .amend(
+                        &employee.id,
+                        version(&contracts, &employee.id, monthly(rate, from)).await,
+                    )
+                    .await
+                    .expect("written");
+            }
+
+            let march = contracts
+                .current(&employee.id, date("2026-03-15"))
+                .await
+                .expect("query runs")
+                .expect("in force");
+            assert_eq!(march.terms.rate.to_string(), "3200000.0000");
+
+            let july = contracts
+                .current(&employee.id, date("2026-07-15"))
+                .await
+                .expect("query runs")
+                .expect("in force");
+            assert_eq!(july.terms.rate.to_string(), "3600000.0000");
+
+            let december = contracts
+                .current(&employee.id, date("2026-12-15"))
+                .await
+                .expect("query runs")
+                .expect("in force");
+            assert_eq!(december.terms.rate.to_string(), "4000000.0000");
+        }
+
+        #[tokio::test]
+        async fn the_windows_meet_exactly_with_no_gap_and_no_overlap() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            for (rate, from) in [("3200000", HIRED), ("3600000", "2026-06-01")] {
+                contracts
+                    .amend(
+                        &employee.id,
+                        version(&contracts, &employee.id, monthly(rate, from)).await,
+                    )
+                    .await
+                    .expect("written");
+            }
+
+            // Every day from the hire date onwards resolves to exactly one
+            // version — the handover day included.
+            for day in ["2026-05-30", "2026-05-31", "2026-06-01", "2026-06-02"] {
+                let covering = contracts
+                    .history(&employee.id)
+                    .await
+                    .expect("query runs")
+                    .into_iter()
+                    .filter(|version| version.covers(date(day)))
+                    .count();
+                assert_eq!(covering, 1, "{day} is covered by exactly one version");
+            }
+        }
+
+        #[tokio::test]
+        async fn there_is_nothing_in_force_before_the_first_version_starts() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            contracts
+                .amend(&employee.id, version(&contracts, &employee.id, monthly("3200000", HIRED)).await)
+                .await
+                .expect("written");
+
+            assert_eq!(
+                contracts.current(&employee.id, date("2026-01-31")).await.expect("query runs"),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn an_employee_with_no_contract_has_none_rather_than_an_error() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            assert_eq!(
+                contracts.current(&employee.id, date("2026-06-01")).await.expect("query runs"),
+                None
+            );
+            assert_eq!(contracts.latest(&employee.id).await.expect("query runs"), None);
+            assert!(contracts.history(&employee.id).await.expect("query runs").is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_contract_needs_an_employee_that_exists() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            let draft = version(&contracts, &employee.id, monthly("3200000", HIRED)).await;
+
+            let result = contracts.amend(&EmployeeId::from("ghost"), draft).await;
+            assert!(matches!(result, Err(AppError::NotFound { entity: "employee", .. })));
+        }
+
+        #[tokio::test]
+        async fn two_versions_cannot_begin_on_the_same_day() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            let first = version(&contracts, &employee.id, monthly("3200000", HIRED)).await;
+            contracts.amend(&employee.id, first).await.expect("written");
+
+            // Validation would normally catch this; the unique index is the
+            // backstop if a caller ever bypasses it.
+            let same_day = monthly("3600000", HIRED)
+                .validate(ContractContext::first(date(HIRED)))
+                .expect("valid on its own");
+            match contracts.amend(&employee.id, same_day).await {
+                Err(AppError::Conflict(message)) => assert!(
+                    message.contains(HIRED),
+                    "the message should name the version being replaced: {message}"
+                ),
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn discarding_the_latest_amendment_reopens_the_one_before_it() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            for (rate, from) in [("3200000", HIRED), ("3600000", "2026-06-01")] {
+                contracts
+                    .amend(
+                        &employee.id,
+                        version(&contracts, &employee.id, monthly(rate, from)).await,
+                    )
+                    .await
+                    .expect("written");
+            }
+
+            let discarded = contracts.discard_latest(&employee.id).await.expect("discarded");
+            assert_eq!(discarded.valid_from, date("2026-06-01"));
+
+            let history = contracts.history(&employee.id).await.expect("query runs");
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].valid_to, None, "the earlier version is in force again");
+
+            // …and it now answers for the dates the discarded one covered.
+            let july = contracts
+                .current(&employee.id, date("2026-07-15"))
+                .await
+                .expect("query runs")
+                .expect("in force");
+            assert_eq!(july.terms.rate.to_string(), "3200000.0000");
+        }
+
+        #[tokio::test]
+        async fn discarding_the_only_version_leaves_no_contract() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            contracts
+                .amend(&employee.id, version(&contracts, &employee.id, monthly("3200000", HIRED)).await)
+                .await
+                .expect("written");
+
+            contracts.discard_latest(&employee.id).await.expect("discarded");
+            assert!(contracts.history(&employee.id).await.expect("query runs").is_empty());
+        }
+
+        #[tokio::test]
+        async fn there_is_nothing_to_discard_without_a_contract() {
+            let (_, _, contracts, _, _, employee) = employed().await;
+            assert!(matches!(
+                contracts.discard_latest(&employee.id).await,
+                Err(AppError::NotFound { entity: "contract", .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn contracts_ending_soon_lists_only_current_versions_in_the_window() {
+            let (_, employees, contracts, _, project, employee) = employed().await;
+
+            let mut ending = monthly("3200000", HIRED);
+            ending.end = Some(date("2026-10-31"));
+            contracts
+                .amend(&employee.id, version(&contracts, &employee.id, ending).await)
+                .await
+                .expect("written");
+
+            // Somebody whose contract runs well past the window.
+            let later = employees
+                .create(
+                    &project.id,
+                    EmployeeDraft::new("Fara", "Rasoanaivo", "HSE officer", date(HIRED))
+                        .validate()
+                        .expect("valid"),
+                )
+                .await
+                .expect("hired");
+            let mut far_off = monthly("2450000", HIRED);
+            far_off.end = Some(date("2028-01-31"));
+            contracts
+                .amend(&later.id, version(&contracts, &later.id, far_off).await)
+                .await
+                .expect("written");
+
+            let soon = contracts
+                .ending_between(&project.id, date("2026-09-01"), date("2026-12-31"))
+                .await
+                .expect("query runs");
+
+            assert_eq!(soon.len(), 1);
+            assert_eq!(soon[0].employee_id, employee.id);
+            assert_eq!(soon[0].terms.end, Some(date("2026-10-31")));
+        }
+
+        #[tokio::test]
+        async fn a_superseded_version_is_not_listed_as_ending_soon() {
+            let (_, _, contracts, _, project, employee) = employed().await;
+
+            let mut first = monthly("3200000", HIRED);
+            first.end = Some(date("2026-10-31"));
+            contracts
+                .amend(&employee.id, version(&contracts, &employee.id, first).await)
+                .await
+                .expect("written");
+
+            // The extension moves the end date out of the window.
+            let mut extended = monthly("3600000", "2026-06-01");
+            extended.end = Some(date("2027-06-30"));
+            contracts
+                .amend(&employee.id, version(&contracts, &employee.id, extended).await)
+                .await
+                .expect("written");
+
+            let soon = contracts
+                .ending_between(&project.id, date("2026-09-01"), date("2026-12-31"))
+                .await
+                .expect("query runs");
+            assert!(soon.is_empty(), "the old version's end date must not surface");
+        }
+
+        #[tokio::test]
+        async fn an_open_ended_contract_never_shows_as_ending() {
+            let (_, _, contracts, _, project, employee) = employed().await;
+            contracts
+                .amend(&employee.id, version(&contracts, &employee.id, monthly("3200000", HIRED)).await)
+                .await
+                .expect("written");
+
+            let soon = contracts
+                .ending_between(&project.id, date("2020-01-01"), date("2099-01-01"))
+                .await
+                .expect("query runs");
+            assert!(soon.is_empty());
+        }
+
+        #[tokio::test]
+        async fn removing_an_employee_takes_every_version_with_them() {
+            let (_, employees, contracts, _, _, employee) = employed().await;
+            contracts
+                .amend(&employee.id, version(&contracts, &employee.id, monthly("3200000", HIRED)).await)
+                .await
+                .expect("written");
+
+            employees.delete(&employee.id).await.expect("removed");
+
+            assert!(contracts.history(&employee.id).await.expect("query runs").is_empty());
+        }
+
+        #[tokio::test]
+        async fn every_version_is_logged_as_written_once_and_never_edited() {
+            let (_, _, contracts, log, _, employee) = employed().await;
+            let first = contracts
+                .amend(&employee.id, version(&contracts, &employee.id, monthly("3200000", HIRED)).await)
+                .await
+                .expect("written");
+            let raise = contracts
+                .amend(
+                    &employee.id,
+                    version(&contracts, &employee.id, monthly("3600000", "2026-06-01")).await,
+                )
+                .await
+                .expect("written");
+
+            // A raise is a create, not an update — that is the whole point.
+            for version in [&first, &raise] {
+                let history =
+                    log.history("contract", version.id.as_str()).await.expect("query runs");
+                let actions: Vec<AuditAction> = history.iter().map(|e| e.action).collect();
+                assert_eq!(actions, [AuditAction::Create]);
+            }
+
+            contracts.discard_latest(&employee.id).await.expect("discarded");
+            let after = log.history("contract", raise.id.as_str()).await.expect("query runs");
+            assert_eq!(after.last().expect("logged").action, AuditAction::Delete);
         }
     }
 }

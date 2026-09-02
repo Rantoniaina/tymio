@@ -13,6 +13,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::attendance::{AttendanceEntry, AttendanceSheet, ValidAttendance};
+use crate::domain::contract::{Contract, ValidContract};
 use crate::domain::calendar::{HolidaySet, YearMonth};
 use crate::domain::employee::{
     Employee, EmployeeFilter, EmployeeId, EmployeeStats, ValidEmployee,
@@ -130,6 +131,40 @@ pub trait AttendanceRepository: Send + Sync {
 
     /// One person's history, most recent month first.
     async fn history(&self, employee: &EmployeeId) -> Result<Vec<AttendanceEntry>>;
+}
+
+/// Contracts, stored as effective-dated versions.
+///
+/// There is no `update`. Terms are never edited: `amend` writes a new version
+/// and closes the previous one's window, which is what makes an old payroll
+/// run still reproduce.
+#[async_trait]
+pub trait ContractRepository: Send + Sync {
+    /// The version in force on `as_of`, if any.
+    async fn current(&self, employee: &EmployeeId, as_of: NaiveDate) -> Result<Option<Contract>>;
+
+    /// The newest version, whatever date it starts on.
+    async fn latest(&self, employee: &EmployeeId) -> Result<Option<Contract>>;
+
+    /// Every version, newest first.
+    async fn history(&self, employee: &EmployeeId) -> Result<Vec<Contract>>;
+
+    /// Writes a new version. The first one for an employee simply opens; a
+    /// later one closes the version it supersedes the day before it starts.
+    async fn amend(&self, employee: &EmployeeId, contract: ValidContract) -> Result<Contract>;
+
+    /// Removes the newest version and reopens the one before it — the undo for
+    /// an amendment entered by mistake. Older versions are never removable.
+    async fn discard_latest(&self, employee: &EmployeeId) -> Result<Contract>;
+
+    /// Current contracts on a project whose own end date falls in the window.
+    /// This is the overview's "Contracts ending soon".
+    async fn ending_between(
+        &self,
+        project: &ProjectId,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<Contract>>;
 }
 
 /// What happened to a record. The `audit_log` CHECK accepts nothing else.

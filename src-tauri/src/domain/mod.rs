@@ -2,6 +2,7 @@
 
 pub mod attendance;
 pub mod calendar;
+pub mod contract;
 pub mod employee;
 pub mod project;
 

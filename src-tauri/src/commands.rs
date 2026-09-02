@@ -16,6 +16,7 @@ use crate::domain::attendance::{
     WorkedDays, WorkedTime,
 };
 use crate::domain::calendar::YearMonth;
+use crate::domain::contract::{Contract, ContractContext, ContractDraft};
 use crate::domain::employee::{
     Employee, EmployeeDraft, EmployeeFilter, EmployeeId, EmployeeStats,
 };
@@ -25,11 +26,12 @@ use crate::domain::project::{
 };
 use crate::error::Result;
 use crate::repo::sqlite::{
-    SqliteActivityRepository, SqliteAttendanceRepository, SqliteEmployeeRepository,
-    SqliteProjectRepository,
+    SqliteActivityRepository, SqliteAttendanceRepository, SqliteContractRepository,
+    SqliteEmployeeRepository, SqliteProjectRepository,
 };
 use crate::repo::{
-    ActivityRepository, AttendanceRepository, AuditEntry, EmployeeRepository, ProjectRepository,
+    ActivityRepository, AttendanceRepository, AuditEntry, ContractRepository, EmployeeRepository,
+    ProjectRepository,
 };
 
 /// How many audit rows the overview's activity list asks for by default.
@@ -42,6 +44,7 @@ pub struct AppState {
     projects: Arc<dyn ProjectRepository>,
     employees: Arc<dyn EmployeeRepository>,
     attendance: Arc<dyn AttendanceRepository>,
+    contracts: Arc<dyn ContractRepository>,
     activity: Arc<dyn ActivityRepository>,
 }
 
@@ -51,6 +54,7 @@ impl AppState {
             projects: Arc::new(SqliteProjectRepository::new(db.clone())),
             employees: Arc::new(SqliteEmployeeRepository::new(db.clone())),
             attendance: Arc::new(SqliteAttendanceRepository::new(db.clone())),
+            contracts: Arc::new(SqliteContractRepository::new(db.clone())),
             activity: Arc::new(SqliteActivityRepository::new(db)),
         }
     }
@@ -252,6 +256,54 @@ impl AppState {
     pub async fn employee_attendance(&self, employee: EmployeeId) -> Result<Vec<AttendanceEntry>> {
         self.attendance.history(&employee).await
     }
+
+    /// The terms in force on a date — what payroll asks for.
+    pub async fn current_contract(
+        &self,
+        employee: EmployeeId,
+        as_of: Option<NaiveDate>,
+    ) -> Result<Option<Contract>> {
+        self.contracts.current(&employee, as_of.unwrap_or_else(Self::today)).await
+    }
+
+    pub async fn contract_history(&self, employee: EmployeeId) -> Result<Vec<Contract>> {
+        self.contracts.history(&employee).await
+    }
+
+    /// Writes a new version of an employee's contract.
+    ///
+    /// The same command creates the first one and records a raise: the
+    /// difference is whether there is anything to supersede, which is read
+    /// here and handed to validation rather than guessed at by the caller.
+    pub async fn amend_contract(
+        &self,
+        employee: EmployeeId,
+        draft: ContractDraft,
+    ) -> Result<Contract> {
+        let person = self.employees.require(&employee).await?;
+        let context = match self.contracts.latest(&employee).await? {
+            Some(current) => ContractContext::amending(person.hire_date, &current),
+            None => ContractContext::first(person.hire_date),
+        };
+        self.contracts.amend(&employee, draft.validate(context)?).await
+    }
+
+    /// Undoes the most recent amendment.
+    pub async fn discard_latest_contract(&self, employee: EmployeeId) -> Result<Contract> {
+        self.contracts.discard_latest(&employee).await
+    }
+
+    /// The overview's "Contracts ending soon". Defaults to the next 90 days.
+    pub async fn contracts_ending(
+        &self,
+        project: ProjectId,
+        from: Option<NaiveDate>,
+        within_days: Option<u32>,
+    ) -> Result<Vec<Contract>> {
+        let from = from.unwrap_or_else(Self::today);
+        let to = from + chrono::Duration::days(i64::from(within_days.unwrap_or(90)));
+        self.contracts.ending_between(&project, from, to).await
+    }
 }
 
 #[tauri::command]
@@ -420,6 +472,50 @@ pub async fn fill_attendance_from_schedule(
     period: YearMonth,
 ) -> Result<AttendanceSheet> {
     state.fill_attendance_from_schedule(project, period).await
+}
+
+#[tauri::command]
+pub async fn current_contract(
+    state: State<'_, AppState>,
+    employee: EmployeeId,
+    as_of: Option<NaiveDate>,
+) -> Result<Option<Contract>> {
+    state.current_contract(employee, as_of).await
+}
+
+#[tauri::command]
+pub async fn contract_history(
+    state: State<'_, AppState>,
+    employee: EmployeeId,
+) -> Result<Vec<Contract>> {
+    state.contract_history(employee).await
+}
+
+#[tauri::command]
+pub async fn amend_contract(
+    state: State<'_, AppState>,
+    employee: EmployeeId,
+    draft: ContractDraft,
+) -> Result<Contract> {
+    state.amend_contract(employee, draft).await
+}
+
+#[tauri::command]
+pub async fn discard_latest_contract(
+    state: State<'_, AppState>,
+    employee: EmployeeId,
+) -> Result<Contract> {
+    state.discard_latest_contract(employee).await
+}
+
+#[tauri::command]
+pub async fn contracts_ending(
+    state: State<'_, AppState>,
+    project: ProjectId,
+    from: Option<NaiveDate>,
+    within_days: Option<u32>,
+) -> Result<Vec<Contract>> {
+    state.contracts_ending(project, from, within_days).await
 }
 
 #[tauri::command]
@@ -1020,6 +1116,201 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(AppError::NotFound { entity: "project", .. })));
+        }
+    }
+
+    mod contracts {
+        use super::*;
+
+        use crate::domain::contract::{ContractDraft, PayType, round_ariary};
+        use crate::domain::employee::EmployeeDraft;
+
+        const HIRED: &str = "2026-02-01";
+
+        async fn employed() -> (AppState, ProjectId, EmployeeId) {
+            let state = state().await;
+            let project = state
+                .create_project(ProjectDraft::new("Ambatolampy Solar Farm", date("2026-01-01")))
+                .await
+                .expect("stored");
+            let employee = state
+                .create_employee(
+                    project.id.clone(),
+                    EmployeeDraft::new("Rakoto", "Randrianasolo", "Site supervisor", date(HIRED)),
+                )
+                .await
+                .expect("hired");
+            (state, project.id, employee.id)
+        }
+
+        #[tokio::test]
+        async fn the_first_contract_and_a_raise_go_through_the_same_command() {
+            let (state, _, employee) = employed().await;
+
+            let first = state
+                .amend_contract(employee.clone(), ContractDraft::monthly("3200000", date(HIRED)))
+                .await
+                .expect("first contract");
+            assert!(first.is_current());
+
+            let raise = state
+                .amend_contract(
+                    employee.clone(),
+                    ContractDraft::monthly("3600000", date("2026-06-01")),
+                )
+                .await
+                .expect("raise");
+
+            assert!(raise.is_current());
+            assert_eq!(state.contract_history(employee).await.expect("query runs").len(), 2);
+        }
+
+        #[tokio::test]
+        async fn an_invalid_draft_never_reaches_storage() {
+            let (state, _, employee) = employed().await;
+
+            let error = state
+                .amend_contract(employee.clone(), ContractDraft::monthly("0", date(HIRED)))
+                .await
+                .expect_err("a rate of zero is not a rate");
+
+            match error {
+                AppError::Validation(errors) => assert!(errors.has("rate")),
+                other => panic!("expected validation, got {other:?}"),
+            }
+            assert!(state.contract_history(employee).await.expect("query runs").is_empty());
+        }
+
+        #[tokio::test]
+        async fn the_command_reads_what_is_in_force_rather_than_trusting_the_caller() {
+            let (state, _, employee) = employed().await;
+            state
+                .amend_contract(employee.clone(), ContractDraft::monthly("3200000", date("2026-06-01")))
+                .await
+                .expect("first contract");
+
+            // Backdating behind the version in force is refused, and the
+            // caller never had to say what that version was.
+            let error = state
+                .amend_contract(employee.clone(), ContractDraft::monthly("3600000", date("2026-03-01")))
+                .await
+                .expect_err("backdated behind the current version");
+
+            match error {
+                AppError::Validation(errors) => assert!(errors.has("effectiveFrom")),
+                other => panic!("expected validation, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn terms_cannot_start_before_the_employee_was_hired() {
+            let (state, _, employee) = employed().await;
+
+            let error = state
+                .amend_contract(employee, ContractDraft::monthly("3200000", date("2026-01-01")))
+                .await
+                .expect_err("before the hire date");
+
+            match error {
+                AppError::Validation(errors) => assert!(errors.has("effectiveFrom")),
+                other => panic!("expected validation, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_contract_for_somebody_who_does_not_exist_is_a_not_found() {
+            let (state, _, _) = employed().await;
+            let result = state
+                .amend_contract(
+                    EmployeeId::from("ghost"),
+                    ContractDraft::monthly("3200000", date(HIRED)),
+                )
+                .await;
+
+            assert!(matches!(result, Err(AppError::NotFound { entity: "employee", .. })));
+        }
+
+        #[tokio::test]
+        async fn the_current_contract_defaults_to_today() {
+            let (state, _, employee) = employed().await;
+            state
+                .amend_contract(employee.clone(), ContractDraft::monthly("3200000", date("2020-01-01")))
+                .await
+                .expect_err("before the hire date, so nothing is stored");
+
+            state
+                .amend_contract(employee.clone(), ContractDraft::monthly("3200000", date(HIRED)))
+                .await
+                .expect("first contract");
+
+            let now = state
+                .current_contract(employee, None)
+                .await
+                .expect("query runs")
+                .expect("in force today");
+            assert_eq!(now.terms.rate.to_string(), "3200000.0000");
+        }
+
+        #[tokio::test]
+        async fn the_pay_basis_conversions_reach_the_command_layer_intact() {
+            let (state, _, employee) = employed().await;
+            let mut draft = ContractDraft::monthly("3200000", date(HIRED));
+            draft.pay_type = PayType::Monthly;
+            state.amend_contract(employee.clone(), draft).await.expect("written");
+
+            let contract = state
+                .current_contract(employee, Some(date("2026-03-01")))
+                .await
+                .expect("query runs")
+                .expect("in force");
+
+            // ÷ 26 and ÷ 173, rounded only here.
+            assert_eq!(round_ariary(contract.terms.daily_equivalent()).to_string(), "123077");
+            assert_eq!(round_ariary(contract.terms.hourly_equivalent()).to_string(), "18497");
+        }
+
+        #[tokio::test]
+        async fn discarding_an_amendment_puts_the_previous_terms_back_in_force() {
+            let (state, _, employee) = employed().await;
+            state
+                .amend_contract(employee.clone(), ContractDraft::monthly("3200000", date(HIRED)))
+                .await
+                .expect("first contract");
+            state
+                .amend_contract(employee.clone(), ContractDraft::monthly("9999999", date("2026-06-01")))
+                .await
+                .expect("a raise entered by mistake");
+
+            state.discard_latest_contract(employee.clone()).await.expect("undone");
+
+            let july = state
+                .current_contract(employee, Some(date("2026-07-01")))
+                .await
+                .expect("query runs")
+                .expect("in force");
+            assert_eq!(july.terms.rate.to_string(), "3200000.0000");
+        }
+
+        #[tokio::test]
+        async fn contracts_ending_soon_defaults_to_the_next_ninety_days() {
+            let (state, project, employee) = employed().await;
+
+            let mut soon = ContractDraft::monthly("3200000", date(HIRED));
+            soon.end = Some(date(HIRED) + chrono::Duration::days(30));
+            state.amend_contract(employee, soon).await.expect("written");
+
+            let ending = state
+                .contracts_ending(project.clone(), Some(date(HIRED)), None)
+                .await
+                .expect("query runs");
+            assert_eq!(ending.len(), 1);
+
+            // …and a shorter window leaves it out.
+            let narrow = state
+                .contracts_ending(project, Some(date(HIRED)), Some(7))
+                .await
+                .expect("query runs");
+            assert!(narrow.is_empty());
         }
     }
 }

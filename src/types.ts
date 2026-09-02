@@ -218,3 +218,56 @@ export interface AttendanceSheet {
   rows: AttendanceRow[];
   totals: AttendanceTotals;
 }
+
+// ----------------------------------------------------------------- contracts
+
+export type PayType = "monthly" | "daily" | "hourly";
+
+export const PAY_TYPES: PayType[] = ["monthly", "daily", "hourly"];
+
+export const PAY_TYPE_LABELS: Record<PayType, string> = {
+  monthly: "Monthly",
+  daily: "Daily",
+  hourly: "Hourly",
+};
+
+export interface ContractTerms {
+  payType: PayType;
+  /** A decimal string, never a number — `123456.7891` does not survive an f64. */
+  rate: string;
+  /** The contract's own duration, not the version window. */
+  start: IsoDate;
+  end: IsoDate | null;
+  /** Whole minutes. */
+  weeklyHours: number;
+  probationMonths: number;
+  /** Half-days: 60 is a 30-day grant. */
+  annualGrant: number;
+  /** Half-days added per month worked. */
+  monthlyAccrual: number;
+}
+
+/** One effective-dated version. Terms are never edited; a change is a new one. */
+export interface Contract {
+  id: string;
+  employeeId: string;
+  validFrom: IsoDate;
+  /** Inclusive. `null` while these terms are the ones in force. */
+  validTo: IsoDate | null;
+  terms: ContractTerms;
+  createdAt: IsoInstant;
+}
+
+export interface ContractDraft {
+  effectiveFrom: IsoDate;
+  payType: PayType;
+  /** As typed: `3200000`, `3 200 000` and `12.5` are all accepted. */
+  rate: string;
+  start: IsoDate;
+  end: IsoDate | null;
+  weeklyMinutes: number | null;
+  probationMonths: number;
+  annualGrantHalves: number;
+  monthlyAccrualHalves: number;
+}
+

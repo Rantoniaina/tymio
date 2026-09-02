@@ -11,6 +11,8 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   AttendanceDraft,
+  Contract,
+  ContractDraft,
   AttendanceEntry,
   AttendanceSheet,
   AuditEntry,
@@ -163,4 +165,20 @@ export const api = {
 
   employeeAttendance: (employee: string) =>
     call<AttendanceEntry[]>("employee_attendance", { employee }),
+
+  // Contracts. No screen calls these yet — the Contract tab is the next slice.
+  currentContract: (employee: string, asOf: IsoDate | null = null) =>
+    call<Contract | null>("current_contract", { employee, asOf }),
+
+  contractHistory: (employee: string) => call<Contract[]>("contract_history", { employee }),
+
+  /** Writes a new version: the first contract and a raise are the same call. */
+  amendContract: (employee: string, draft: ContractDraft) =>
+    call<Contract>("amend_contract", { employee, draft }),
+
+  discardLatestContract: (employee: string) =>
+    call<Contract>("discard_latest_contract", { employee }),
+
+  contractsEnding: (project: string, from: IsoDate | null = null, withinDays: number | null = null) =>
+    call<Contract[]>("contracts_ending", { project, from, withinDays }),
 };
