@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Tauri v2 + React/TS/Vite shell. The **projects** slice of the backend is built and tested; everything else (employees, contracts, leave, payroll, and the whole front end) is still to come. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
 
+Front end under `src/`: `App.tsx` (the project-picker screen), `components/` (card, form modal, confirm dialog, activity panel, toast), `ipc.ts` (the only place that calls `invoke`), `types.ts` (hand-mirrored from the Rust structs), `format.ts` (dd/mm/yyyy dates, space-separated thousands, weekday-mask helpers), `styles.css` (design tokens from the mockup).
+
 Rust layout under `src-tauri/src/`:
 
 | Path | Holds |
@@ -20,6 +22,16 @@ Rust layout under `src-tauri/src/`:
 | `error.rs` | `AppError`, serialised to the front end as `{ kind, message, fields }` |
 | `migrations/0001_init.sql` | `projects`, `project_holidays`, `audit_log` |
 
+### Testing
+
+`cargo test` covers the domain, repository and command layers. The Playwright suite (`e2e/`) covers the front end **against the real Rust backend**, because Playwright cannot drive a Tauri window — the app renders in WKWebView on macOS and there is no WebDriver for it. Instead:
+
+- `src-tauri/examples/devserver.rs` puts the same `AppState` methods behind HTTP on `127.0.0.1:4599`, against an in-memory migrated SQLite database. It is an *example*, not a bin, so `tiny_http` never links into the shipped app.
+- `vite.config.ts` proxies `/ipc` to it, and `e2e/fixtures.ts` defines `window.__TAURI_INTERNALS__.invoke` to POST there. That fixture contains no business logic — it is a transport, not a mock backend.
+- `POST /ipc/__reset` gives each test a fresh database.
+
+So React, the command layer, the repository, the schema and the domain rules are genuinely under test. Tauri's own IPC transport and the three platform webviews are not — those still need manual `npm run tauri dev`.
+
 Conventions worth copying when the next slice lands: drafts are validated into a `Valid*` newtype that the repository is the only consumer of, so nothing invalid can reach the DB by another route; validation collects **every** failing field rather than stopping at the first; and `as_of` dates are passed in, never read from the clock inside the domain, so stats are reproducible in a test.
 
 Pinned by the scaffold: Tauri 2.11.5, React 19, Vite 7, TypeScript 5.8, Rust edition 2021. Package manager is **npm** (bun is not installed on this machine).
@@ -29,7 +41,9 @@ Pinned by the scaffold: Tauri 2.11.5, React 19, Vite 7, TypeScript 5.8, Rust edi
 ```sh
 npm install              # once
 npm run tauri dev        # run the app (Vite on :1420 + Rust, hot reload both sides)
-npm run build            # frontend only: tsc && vite build
+npm run build            # typecheck all three tsconfigs, then vite build
+npm run typecheck        # src, vite.config.ts and the e2e suite
+npm run test:e2e         # Playwright against the real Rust backend (see below)
 npm run tauri build      # packaged installers (needs signing setup, see README)
 
 cd src-tauri && cargo check   # type-check Rust without linking

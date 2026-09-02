@@ -37,4 +37,7 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
+# Only for `examples/devserver.rs`, which puts the commands behind HTTP so the
+# Playwright suite can drive the real Rust backend. Never linked into the app.
+tiny_http = "0.12"
 

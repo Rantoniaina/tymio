@@ -98,6 +98,7 @@ impl FromStr for AuditAction {
 /// One line of the append-only audit log — and one row of the overview's
 /// recent-activity list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuditEntry {
     pub id: i64,
     pub at: DateTime<Utc>,

@@ -271,6 +271,7 @@ impl FromIterator<NaiveDate> for HolidaySet {
 
 /// Which days the project works, and for how long.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkCalendar {
     pub working_days: WeekdayMask,
     pub day_length: DayLength,

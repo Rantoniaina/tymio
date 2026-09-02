@@ -1,7 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
@@ -17,6 +16,16 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || false,
+    // In a packaged app the front end talks to Rust over Tauri's IPC. The
+    // Playwright suite has no Tauri, so it points `invoke` at /ipc and this
+    // proxy forwards to `cargo run --example devserver`, which calls the same
+    // command layer. Dev-server only — `vite build` never sees it.
+    proxy: {
+      "/ipc": {
+        target: process.env.TYMIO_DEVSERVER_URL || "http://127.0.0.1:4599",
+        changeOrigin: false,
+      },
+    },
     hmr: host
       ? {
           protocol: "ws",

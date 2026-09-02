@@ -73,6 +73,7 @@ pub struct UnknownStatus(pub String);
 
 /// A project as it is stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
@@ -109,6 +110,7 @@ impl Project {
 /// Edits replace the whole draft rather than patching fields, because the UI
 /// edits a project through one full form — there is no partial update to model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectDraft {
     pub name: String,
     #[serde(default)]
@@ -256,6 +258,7 @@ impl ValidProject {
 
 /// One non-weekend day off in a project's work calendar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Holiday {
     pub id: HolidayId,
     pub project_id: ProjectId,
@@ -338,6 +341,7 @@ impl ProjectFilter {
 
 /// How far through its duration a project is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DurationProgress {
     pub start: NaiveDate,
     pub end: Option<NaiveDate>,
@@ -396,6 +400,7 @@ impl DurationProgress {
 /// read tables that do not exist yet; they join when employees, leave and
 /// payroll land.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectStats {
     pub project_id: ProjectId,
     pub status: ProjectStatus,
