@@ -4,7 +4,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Scaffold only: a Tauri v2 + React/TS/Vite shell that opens one empty window. No domain code, no database, no migrations, no tests yet. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
+Tauri v2 + React/TS/Vite shell. The **projects** slice of the backend is built and tested; everything else (employees, contracts, leave, payroll, and the whole front end) is still to come. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
+
+Front end under `src/`: `App.tsx` (the project-picker screen), `components/` (card, form modal, confirm dialog, activity panel, toast), `ipc.ts` (the only place that calls `invoke`), `types.ts` (hand-mirrored from the Rust structs), `format.ts` (dd/mm/yyyy dates, space-separated thousands, weekday-mask helpers), `styles.css` (design tokens from the mockup).
+
+Rust layout under `src-tauri/src/`:
+
+| Path | Holds |
+| --- | --- |
+| `domain/calendar.rs` | `WeekdayMask`, `DayLength` (minutes), `YearMonth`, `HolidaySet`, `WorkCalendar` — working-day counting |
+| `domain/project.rs` | `Project`, `ProjectStatus`, `ProjectDraft` → `ValidProject`, `Holiday`, `ProjectFilter`, `DurationProgress`, `ProjectStats`, `PortfolioStats` |
+| `domain/mod.rs` | `ValidationError`/`ValidationErrors`, the `id_type!` newtype macro |
+| `repo/mod.rs` | `ProjectRepository` and `ActivityRepository` traits, `AuditEntry` |
+| `repo/sqlite.rs` | the SQLite implementation; every write is a transaction that also appends its audit row |
+| `db.rs` | pool setup, pragmas, embedded migrations, `Db::in_memory()` for tests |
+| `commands.rs` | `AppState` (where validation happens) plus one-line `#[tauri::command]` wrappers |
+| `error.rs` | `AppError`, serialised to the front end as `{ kind, message, fields }` |
+| `migrations/0001_init.sql` | `projects`, `project_holidays`, `audit_log` |
+
+### Testing
+
+`cargo test` covers the domain, repository and command layers. The Playwright suite (`e2e/`) covers the front end **against the real Rust backend**, because Playwright cannot drive a Tauri window — the app renders in WKWebView on macOS and there is no WebDriver for it. Instead:
+
+- `src-tauri/examples/devserver.rs` puts the same `AppState` methods behind HTTP on `127.0.0.1:4599`, against an in-memory migrated SQLite database. It is an *example*, not a bin, so `tiny_http` never links into the shipped app.
+- `vite.config.ts` proxies `/ipc` to it, and `e2e/fixtures.ts` defines `window.__TAURI_INTERNALS__.invoke` to POST there. That fixture contains no business logic — it is a transport, not a mock backend.
+- `POST /ipc/__reset` gives each test a fresh database.
+
+So React, the command layer, the repository, the schema and the domain rules are genuinely under test. Tauri's own IPC transport and the three platform webviews are not — those still need manual `npm run tauri dev`.
+
+Conventions worth copying when the next slice lands: drafts are validated into a `Valid*` newtype that the repository is the only consumer of, so nothing invalid can reach the DB by another route; validation collects **every** failing field rather than stopping at the first; and `as_of` dates are passed in, never read from the clock inside the domain, so stats are reproducible in a test.
 
 Pinned by the scaffold: Tauri 2.11.5, React 19, Vite 7, TypeScript 5.8, Rust edition 2021. Package manager is **npm** (bun is not installed on this machine).
 
@@ -13,12 +41,15 @@ Pinned by the scaffold: Tauri 2.11.5, React 19, Vite 7, TypeScript 5.8, Rust edi
 ```sh
 npm install              # once
 npm run tauri dev        # run the app (Vite on :1420 + Rust, hot reload both sides)
-npm run build            # frontend only: tsc && vite build
+npm run build            # typecheck all three tsconfigs, then vite build
+npm run typecheck        # src, vite.config.ts and the e2e suite
+npm run test:e2e         # Playwright against the real Rust backend (see below)
 npm run tauri build      # packaged installers (needs signing setup, see README)
 
 cd src-tauri && cargo check   # type-check Rust without linking
-cd src-tauri && cargo test    # domain-layer tests (none exist yet)
-cd src-tauri && cargo test payroll::tests::unpaid_leave   # single test by path
+cd src-tauri && cargo test    # domain, repository and command tests
+cd src-tauri && cargo test domain::project    # one module
+cd src-tauri && cargo clippy --all-targets    # clean as of the projects slice
 ```
 
 Notes that cost time if unknown:
@@ -46,6 +77,7 @@ These are settled and load-bearing. `README.md` has the full rationale; the shor
 - **Payslip PDFs are generated in Rust**, never via `window.print()` or webview print-to-PDF — the three webviews render differently.
 - **All DB access behind a repository trait**, so single-user SQLite could become a client of something else.
 - **`PRAGMA foreign_keys = ON`** — SQLite defaults it off and this schema is heavily relational.
+- **The DB file lives in the OS app data dir**, resolved at runtime via Tauri's `app_data_dir()` (`~/Library/Application Support/io.tymio.hr/tymio.db` on macOS) — never beside the binary, the CWD, or in the repo.
 
 ## Domain rules extracted from the mockup
 
@@ -97,6 +129,7 @@ Fonts and the React UMD bundles are also in the manifest, keyed by UUID, gzipped
 
 ## Unsettled
 
+- **Settings view.** The mockup has none, but backup / restore / clear-to-empty-database are required (see README “Database maintenance”). Build them as Rust commands first; ask the user before designing UI for them.
 - **Overtime** (`×1.3`) appears throughout the mockup but never came up when scope was agreed. Confirm with the user before building it into the payroll engine or the schema.
 - **Project `client` field** is in the mockup but not in the README's schema sketch.
 - The mockup shows an "HR admin" user chip, but scope is explicitly single-user with no authentication. Treat the chip as decoration.
