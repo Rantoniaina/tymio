@@ -46,6 +46,7 @@ These are settled and load-bearing. `README.md` has the full rationale; the shor
 - **Payslip PDFs are generated in Rust**, never via `window.print()` or webview print-to-PDF — the three webviews render differently.
 - **All DB access behind a repository trait**, so single-user SQLite could become a client of something else.
 - **`PRAGMA foreign_keys = ON`** — SQLite defaults it off and this schema is heavily relational.
+- **The DB file lives in the OS app data dir**, resolved at runtime via Tauri's `app_data_dir()` (`~/Library/Application Support/io.tymio.hr/tymio.db` on macOS) — never beside the binary, the CWD, or in the repo.
 
 ## Domain rules extracted from the mockup
 
@@ -97,6 +98,7 @@ Fonts and the React UMD bundles are also in the manifest, keyed by UUID, gzipped
 
 ## Unsettled
 
+- **Settings view.** The mockup has none, but backup / restore / clear-to-empty-database are required (see README “Database maintenance”). Build them as Rust commands first; ask the user before designing UI for them.
 - **Overtime** (`×1.3`) appears throughout the mockup but never came up when scope was agreed. Confirm with the user before building it into the payroll engine or the schema.
 - **Project `client` field** is in the mockup but not in the README's schema sketch.
 - The mockup shows an "HR admin" user chip, but scope is explicitly single-user with no authentication. Treat the chip as decoration.

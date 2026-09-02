@@ -96,6 +96,28 @@ The database holds employee PII and salaries, on one machine, with no server beh
 - Backup and restore ship before v1 — `VACUUM INTO` for clean snapshot copies. A corrupted SQLite file with no backup is total loss of HR records.
 - CSV/JSON export early: an escape hatch, and the answer to a data-subject request.
 
+### Where the database lives
+
+Resolved at runtime from the Tauri `AppHandle`, never relative to the executable or the working directory — an installed bundle is read-only and code-signed, and the data has to outlive app upgrades and reinstalls.
+
+| Platform | `app_data_dir()` | File |
+| --- | --- | --- |
+| macOS | `~/Library/Application Support/io.tymio.hr/` | `tymio.db` |
+| Windows | `%APPDATA%\io.tymio.hr\` | `tymio.db` |
+| Linux | `~/.local/share/io.tymio.hr/` | `tymio.db` |
+
+The directory is created on first run, then migrations run against the file inside it. A path override exists only for tests, pointing at a temp dir.
+
+### Database maintenance
+
+Three operations on that file, built as Rust commands on the repository layer:
+
+- **Backup** — `VACUUM INTO` a user-chosen path. Clean snapshot, no WAL to reason about.
+- **Restore** — close the pool, move the live file aside under a timestamped name, put the snapshot in place, reopen, run migrations.
+- **Clear** — same sequence, but into a freshly migrated empty database.
+
+The mockup has **no settings view**, so there is currently nowhere in the design to expose these. Build the commands first; the surface that hosts them still has to be designed.
+
 ## Known risks
 
 **WebKitGTK table performance on Linux.** The most common Linux complaint about Tauri is slow layout on large tables — and this is a table-heavy app. Mitigation: virtualise any list that can grow (never render thousands of DOM rows), keep CSS animation modest, and test on Linux from the first week rather than before release.
