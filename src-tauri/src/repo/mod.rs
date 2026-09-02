@@ -13,6 +13,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::calendar::HolidaySet;
+use crate::domain::employee::{
+    Employee, EmployeeFilter, EmployeeId, EmployeeStats, ValidEmployee,
+};
 use crate::domain::project::{
     Holiday, HolidayId, PortfolioStats, Project, ProjectFilter, ProjectId, ProjectStats,
     ValidHoliday, ValidProject,
@@ -55,6 +58,33 @@ pub trait ProjectRepository: Send + Sync {
     }
 
     async fn remove_holiday(&self, project: &ProjectId, holiday: &HolidayId) -> Result<()>;
+}
+
+/// Everything the employees screens need from storage.
+#[async_trait]
+pub trait EmployeeRepository: Send + Sync {
+    /// Hires someone onto a project. The project has to exist; an employee
+    /// belongs to exactly one, and never moves.
+    async fn create(&self, project: &ProjectId, draft: ValidEmployee) -> Result<Employee>;
+
+    async fn get(&self, id: &EmployeeId) -> Result<Option<Employee>>;
+
+    async fn require(&self, id: &EmployeeId) -> Result<Employee> {
+        self.get(id).await?.ok_or_else(|| AppError::not_found("employee", id))
+    }
+
+    /// Employees matching the filter, ordered by last name then first name.
+    async fn list(&self, filter: &EmployeeFilter) -> Result<Vec<Employee>>;
+
+    /// Replaces every editable field. Identity, project and creation time stay.
+    async fn update(&self, id: &EmployeeId, draft: ValidEmployee) -> Result<Employee>;
+
+    async fn delete(&self, id: &EmployeeId) -> Result<Employee>;
+
+    /// How many people are on one project.
+    async fn headcount(&self, project: &ProjectId) -> Result<u32>;
+
+    async fn stats(&self, id: &EmployeeId, as_of: NaiveDate) -> Result<EmployeeStats>;
 }
 
 /// What happened to a record. The `audit_log` CHECK accepts nothing else.

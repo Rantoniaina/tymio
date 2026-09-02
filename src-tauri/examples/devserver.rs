@@ -28,7 +28,6 @@ use tokio::runtime::Runtime;
 use tymio_lib::commands::AppState;
 use tymio_lib::db::Db;
 use tymio_lib::error::AppError;
-use tymio_lib::repo::sqlite::SqliteRepository;
 
 const DEFAULT_PORT: u16 = 4599;
 
@@ -76,7 +75,7 @@ fn fresh_state(runtime: &Runtime) -> AppState {
     // In-memory: every run of the suite starts from an empty database, and
     // nothing is left on disk afterwards.
     let db = runtime.block_on(Db::in_memory()).expect("in-memory database opens");
-    AppState::new(Arc::new(SqliteRepository::new(db)))
+    AppState::new(db)
 }
 
 /// Pulls one named argument out of the JSON body.
@@ -142,6 +141,25 @@ fn dispatch(
             )?,
         ),
         "recent_activity" => encode(runtime.block_on(state.recent_activity(arg(args, "limit")?))?),
+        "create_employee" => encode(
+            runtime.block_on(
+                state.create_employee(required(args, "project")?, required(args, "draft")?),
+            )?,
+        ),
+        "get_employee" => encode(runtime.block_on(state.get_employee(required(args, "id")?))?),
+        "list_employees" => {
+            encode(runtime.block_on(state.list_employees(arg(args, "filter")?))?)
+        }
+        "update_employee" => encode(
+            runtime
+                .block_on(state.update_employee(required(args, "id")?, required(args, "draft")?))?,
+        ),
+        "delete_employee" => {
+            encode(runtime.block_on(state.delete_employee(required(args, "id")?))?)
+        }
+        "employee_stats" => encode(
+            runtime.block_on(state.employee_stats(required(args, "id")?, arg(args, "asOf")?))?,
+        ),
         unknown => {
             return Err(AppError::Storage(format!("no such command: {unknown}")));
         }

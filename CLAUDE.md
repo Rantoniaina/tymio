@@ -4,9 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Tauri v2 + React/TS/Vite shell. The **projects** slice of the backend is built and tested; everything else (employees, contracts, leave, payroll, and the whole front end) is still to come. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
+Tauri v2 + React/TS/Vite shell. The **projects** and **employees** slices are built end to end (Rust + UI + Playwright). Contracts, leave, attendance and payroll are still to come — the nav and the employee-file tabs for those render a `ComingSoon` panel saying which slice they wait on. `design/Tymio HR.html` is the UI target; `README.md` is the design spec.
 
-Front end under `src/`: `App.tsx` (the project-picker screen), `components/` (card, form modal, confirm dialog, activity panel, toast), `ipc.ts` (the only place that calls `invoke`), `types.ts` (hand-mirrored from the Rust structs), `format.ts` (dd/mm/yyyy dates, space-separated thousands, weekday-mask helpers), `styles.css` (design tokens from the mockup).
+Front end under `src/`:
+
+- `App.tsx` — two screens: pick a project, then work inside it. Owns the toast.
+- `screens/` — `ProjectsScreen` (the picker), `Workspace` (rail + topbar + view routing), `EmployeesView` (the table), `EmployeeFile` (header, tabs, detail panels).
+- `components/` — project card, both form modals, confirm dialog, activity panel, avatar, detail list, `ComingSoon`, toast.
+- `ipc.ts` (the only place that calls `invoke`), `types.ts` (hand-mirrored from the Rust structs), `format.ts` (dd/mm/yyyy dates, space-separated thousands, month/service/weekday-mask helpers), `styles.css` (design tokens from the mockup).
+
+**Form fields associate their label with `htmlFor` and their hint with `aria-describedby`.** Nesting a hint inside the `<label>` folds it into the input's accessible name, which breaks `getByLabel` and screen readers alike.
 
 Rust layout under `src-tauri/src/`:
 
@@ -14,13 +21,15 @@ Rust layout under `src-tauri/src/`:
 | --- | --- |
 | `domain/calendar.rs` | `WeekdayMask`, `DayLength` (minutes), `YearMonth`, `HolidaySet`, `WorkCalendar` — working-day counting |
 | `domain/project.rs` | `Project`, `ProjectStatus`, `ProjectDraft` → `ValidProject`, `Holiday`, `ProjectFilter`, `DurationProgress`, `ProjectStats`, `PortfolioStats` |
+| `domain/employee.rs` | `Employee`, `EmployeeDraft` → `ValidEmployee`, `EmployeeFilter`, `EmployeeStats`; age, whole-months service, and `months_worked_in` (the mockup's accrual driver) |
 | `domain/mod.rs` | `ValidationError`/`ValidationErrors`, the `id_type!` newtype macro |
-| `repo/mod.rs` | `ProjectRepository` and `ActivityRepository` traits, `AuditEntry` |
-| `repo/sqlite.rs` | the SQLite implementation; every write is a transaction that also appends its audit row |
+| `repo/mod.rs` | `ProjectRepository`, `EmployeeRepository` and `ActivityRepository` traits, `AuditEntry` |
+| `repo/sqlite.rs` | `SqliteProjectRepository`, `SqliteEmployeeRepository`, `SqliteActivityRepository` — **one struct per aggregate**, because several traits on one type make every `create`/`get`/`list` call ambiguous. Every write is a transaction that also appends its audit row |
 | `db.rs` | pool setup, pragmas, embedded migrations, `Db::in_memory()` for tests |
-| `commands.rs` | `AppState` (where validation happens) plus one-line `#[tauri::command]` wrappers |
+| `commands.rs` | `AppState::new(db)` builds one repository per trait; validation happens here, then one-line `#[tauri::command]` wrappers |
 | `error.rs` | `AppError`, serialised to the front end as `{ kind, message, fields }` |
 | `migrations/0001_init.sql` | `projects`, `project_holidays`, `audit_log` |
+| `migrations/0002_employees.sql` | `employees` — CIN unique where recorded, cascade from the project |
 
 ### Testing
 
@@ -29,6 +38,7 @@ Rust layout under `src-tauri/src/`:
 - `src-tauri/examples/devserver.rs` puts the same `AppState` methods behind HTTP on `127.0.0.1:4599`, against an in-memory migrated SQLite database. It is an *example*, not a bin, so `tiny_http` never links into the shipped app.
 - `vite.config.ts` proxies `/ipc` to it, and `e2e/fixtures.ts` defines `window.__TAURI_INTERNALS__.invoke` to POST there. That fixture contains no business logic — it is a transport, not a mock backend.
 - `POST /ipc/__reset` gives each test a fresh database.
+- `e2e/helpers.ts` holds the shared page actions (`createProject`, `enterProject`, `addEmployee`, `detail`); the specs stay declarative.
 
 So React, the command layer, the repository, the schema and the domain rules are genuinely under test. Tauri's own IPC transport and the three platform webviews are not — those still need manual `npm run tauri dev`.
 

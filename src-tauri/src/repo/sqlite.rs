@@ -17,29 +17,63 @@ use crate::domain::project::{
     ProjectStatus, ValidHoliday, ValidProject,
 };
 use crate::domain::calendar::{DayLength, WeekdayMask, WorkCalendar};
+use crate::domain::employee::{
+    Employee, EmployeeFilter, EmployeeId, EmployeeStats, ValidEmployee,
+};
 use crate::error::{AppError, Result};
 
-use super::{ActivityRepository, AuditAction, AuditEntry, ProjectRepository};
+use super::{ActivityRepository, AuditAction, AuditEntry, EmployeeRepository, ProjectRepository};
 
 const PROJECT_ENTITY: &str = "project";
 const HOLIDAY_ENTITY: &str = "project_holiday";
+const EMPLOYEE_ENTITY: &str = "employee";
 
 const PROJECT_COLUMNS: &str = "id, name, client, location, status, start_date, end_date, \
                                working_days_mask, hours_per_day_minutes, created_at, updated_at";
 
-#[derive(Debug, Clone)]
-pub struct SqliteRepository {
-    db: Db,
+const EMPLOYEE_COLUMNS: &str = "id, project_id, first_name, last_name, role, email, phone, \
+                                address, cin, birth_date, hire_date, bank_account, \
+                                emergency_contact, created_at, updated_at";
+
+/// Declares a repository struct that owns a handle on the pool.
+///
+/// One per aggregate rather than one that implements every trait: the traits
+/// all want to call their methods `create`, `get` and `list`, and a single
+/// type implementing several of them makes every one of those calls ambiguous.
+macro_rules! repository {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone)]
+        pub struct $name {
+            db: Db,
+        }
+
+        impl $name {
+            pub fn new(db: Db) -> Self {
+                $name { db }
+            }
+
+            pub fn db(&self) -> &Db {
+                &self.db
+            }
+        }
+    };
 }
 
-impl SqliteRepository {
-    pub fn new(db: Db) -> Self {
-        SqliteRepository { db }
-    }
+repository! {
+    /// Projects, their work calendars and their holidays.
+    SqliteProjectRepository
+}
 
-    pub fn db(&self) -> &Db {
-        &self.db
-    }
+repository! {
+    /// The people on those projects.
+    SqliteEmployeeRepository
+}
+
+repository! {
+    /// Reads of the append-only audit log. Writes happen inside the
+    /// transaction of the change they record, not through this.
+    SqliteActivityRepository
 }
 
 /// Appends to the audit log. Takes the transaction's connection so the entry
@@ -114,6 +148,26 @@ fn holiday_from_row(row: &SqliteRow) -> Result<Holiday> {
     })
 }
 
+fn employee_from_row(row: &SqliteRow) -> Result<Employee> {
+    Ok(Employee {
+        id: EmployeeId::from(row.try_get::<String, _>("id")?),
+        project_id: ProjectId::from(row.try_get::<String, _>("project_id")?),
+        first_name: row.try_get("first_name")?,
+        last_name: row.try_get("last_name")?,
+        role: row.try_get("role")?,
+        email: row.try_get("email")?,
+        phone: row.try_get("phone")?,
+        address: row.try_get("address")?,
+        cin: row.try_get("cin")?,
+        birth_date: row.try_get("birth_date")?,
+        hire_date: row.try_get("hire_date")?,
+        bank_account: row.try_get("bank_account")?,
+        emergency_contact: row.try_get("emergency_contact")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn audit_from_row(row: &SqliteRow) -> Result<AuditEntry> {
     let id: i64 = row.try_get("id")?;
     let action: String = row.try_get("action")?;
@@ -150,8 +204,38 @@ fn bind_project<'q>(
         .bind(i64::from(project.calendar.day_length.minutes()))
 }
 
+/// Writes every editable column of an employee. Shared by insert and update
+/// so the two can never disagree about what an employee is made of.
+fn bind_employee<'q>(
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    employee: &'q Employee,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    query
+        .bind(employee.first_name.as_str())
+        .bind(employee.last_name.as_str())
+        .bind(employee.role.as_str())
+        .bind(employee.email.as_deref())
+        .bind(employee.phone.as_deref())
+        .bind(employee.address.as_deref())
+        .bind(employee.cin.as_deref())
+        .bind(employee.birth_date)
+        .bind(employee.hire_date)
+        .bind(employee.bank_account.as_deref())
+        .bind(employee.emergency_contact.as_deref())
+}
+
+/// The message a duplicate CIN should produce. A national identity number
+/// belongs to one person, so this almost always means the record already
+/// exists under another name.
+fn duplicate_cin(cin: Option<&str>) -> String {
+    match cin {
+        Some(cin) => format!("CIN {cin} is already on another employee"),
+        None => "That employee already exists".to_owned(),
+    }
+}
+
 #[async_trait]
-impl ProjectRepository for SqliteRepository {
+impl ProjectRepository for SqliteProjectRepository {
     async fn create(&self, draft: ValidProject) -> Result<Project> {
         let now = Utc::now();
         let project = draft.into_project(ProjectId::new(), now);
@@ -266,10 +350,33 @@ impl ProjectRepository for SqliteRepository {
             .ok_or_else(|| AppError::not_found(PROJECT_ENTITY, id))?;
         let deleted = project_from_row(&row)?;
 
+        // ON DELETE CASCADE is about to take the employees with it, silently.
+        // Snapshot each one first, or the audit log would show a project
+        // disappearing and no trace of the people who were on it.
+        let doomed = sqlx::query(&format!(
+            "SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE project_id = ?1"
+        ))
+        .bind(id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+
         sqlx::query("DELETE FROM projects WHERE id = ?1")
             .bind(id.as_str())
             .execute(&mut *tx)
             .await?;
+
+        for row in &doomed {
+            let employee = employee_from_row(row)?;
+            record(
+                &mut tx,
+                now,
+                EMPLOYEE_ENTITY,
+                employee.id.as_str(),
+                AuditAction::Delete,
+                snapshot(&employee),
+            )
+            .await?;
+        }
 
         // The snapshot is the whole point of logging a delete: the row itself
         // is gone, cascade and all.
@@ -304,13 +411,28 @@ impl ProjectRepository for SqliteRepository {
             }
             stats.total += count;
         }
+
+        let (people,): (i64,) = sqlx::query_as("SELECT count(*) FROM employees")
+            .fetch_one(self.db.pool())
+            .await?;
+        stats.people = u32::try_from(people).unwrap_or(u32::MAX);
+
         Ok(stats)
     }
 
     async fn stats(&self, id: &ProjectId, as_of: NaiveDate) -> Result<ProjectStats> {
         let project = self.require(id).await?;
         let holidays = self.holiday_set(id).await?;
-        Ok(ProjectStats::compute(&project, &holidays, as_of))
+        // One COUNT rather than a call into the employee repository: this is
+        // the same database, and a project's headcount is a fact about the
+        // project's overview, not a reason to depend on another aggregate.
+        let (headcount,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM employees WHERE project_id = ?1")
+                .bind(id.as_str())
+                .fetch_one(self.db.pool())
+                .await?;
+        let headcount = u32::try_from(headcount).unwrap_or(u32::MAX);
+        Ok(ProjectStats::compute(&project, &holidays, headcount, as_of))
     }
 
     async fn add_holiday(&self, project: &ProjectId, holiday: ValidHoliday) -> Result<Holiday> {
@@ -398,7 +520,171 @@ impl ProjectRepository for SqliteRepository {
 }
 
 #[async_trait]
-impl ActivityRepository for SqliteRepository {
+impl EmployeeRepository for SqliteEmployeeRepository {
+    async fn create(&self, project: &ProjectId, draft: ValidEmployee) -> Result<Employee> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        // The foreign key would catch this, but "no project with id …" is a
+        // better answer than a constraint code.
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM projects WHERE id = ?1")
+            .bind(project.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::not_found(PROJECT_ENTITY, project));
+        }
+
+        let employee = draft.into_employee(EmployeeId::new(), project.clone(), now);
+
+        let insert = sqlx::query(
+            "INSERT INTO employees (first_name, last_name, role, email, phone, address, cin, \
+             birth_date, hire_date, bank_account, emergency_contact, id, project_id, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        );
+        bind_employee(insert, &employee)
+            .bind(employee.id.as_str())
+            .bind(employee.project_id.as_str())
+            .bind(employee.created_at)
+            .bind(employee.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::from_sqlx(e, || duplicate_cin(employee.cin.as_deref())))?;
+
+        record(
+            &mut tx,
+            now,
+            EMPLOYEE_ENTITY,
+            employee.id.as_str(),
+            AuditAction::Create,
+            snapshot(&employee),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(employee)
+    }
+
+    async fn get(&self, id: &EmployeeId) -> Result<Option<Employee>> {
+        let row = sqlx::query(&format!("SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE id = ?1"))
+            .bind(id.as_str())
+            .fetch_optional(self.db.pool())
+            .await?;
+
+        row.as_ref().map(employee_from_row).transpose()
+    }
+
+    async fn list(&self, filter: &EmployeeFilter) -> Result<Vec<Employee>> {
+        // The project narrows in SQL; the search box is applied in Rust so
+        // that case folding is Unicode-correct, as for projects.
+        let rows = sqlx::query(&format!(
+            "SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE ?1 IS NULL OR project_id = ?1"
+        ))
+        .bind(filter.project.as_ref().map(|p| p.as_str()))
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let mut employees = rows
+            .iter()
+            .map(employee_from_row)
+            .filter(|e| e.as_ref().map(|e| filter.matches_text(e)).unwrap_or(true))
+            .collect::<Result<Vec<_>>>()?;
+
+        employees.sort_by(|a, b| {
+            let by_name = (a.last_name.to_lowercase(), a.first_name.to_lowercase())
+                .cmp(&(b.last_name.to_lowercase(), b.first_name.to_lowercase()));
+            by_name.then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(employees)
+    }
+
+    async fn update(&self, id: &EmployeeId, draft: ValidEmployee) -> Result<Employee> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let existing =
+            sqlx::query(&format!("SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE id = ?1"))
+                .bind(id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| AppError::not_found(EMPLOYEE_ENTITY, id))?;
+        let existing = employee_from_row(&existing)?;
+
+        let updated = draft.onto(&existing, now);
+
+        let update = sqlx::query(
+            "UPDATE employees SET first_name = ?1, last_name = ?2, role = ?3, email = ?4, \
+             phone = ?5, address = ?6, cin = ?7, birth_date = ?8, hire_date = ?9, \
+             bank_account = ?10, emergency_contact = ?11, updated_at = ?12 WHERE id = ?13",
+        );
+        bind_employee(update, &updated)
+            .bind(updated.updated_at)
+            .bind(updated.id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::from_sqlx(e, || duplicate_cin(updated.cin.as_deref())))?;
+
+        record(
+            &mut tx,
+            now,
+            EMPLOYEE_ENTITY,
+            updated.id.as_str(),
+            AuditAction::Update,
+            snapshot(&updated),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    async fn delete(&self, id: &EmployeeId) -> Result<Employee> {
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await?;
+
+        let row = sqlx::query(&format!("SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE id = ?1"))
+            .bind(id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::not_found(EMPLOYEE_ENTITY, id))?;
+        let deleted = employee_from_row(&row)?;
+
+        sqlx::query("DELETE FROM employees WHERE id = ?1")
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+
+        record(
+            &mut tx,
+            now,
+            EMPLOYEE_ENTITY,
+            deleted.id.as_str(),
+            AuditAction::Delete,
+            snapshot(&deleted),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    async fn headcount(&self, project: &ProjectId) -> Result<u32> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM employees WHERE project_id = ?1")
+                .bind(project.as_str())
+                .fetch_one(self.db.pool())
+                .await?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    async fn stats(&self, id: &EmployeeId, as_of: NaiveDate) -> Result<EmployeeStats> {
+        Ok(self.require(id).await?.service_at(as_of))
+    }
+}
+
+#[async_trait]
+impl ActivityRepository for SqliteActivityRepository {
     async fn recent_activity(&self, limit: u32) -> Result<Vec<AuditEntry>> {
         let rows = sqlx::query(
             "SELECT id, at, entity, entity_id, action, detail FROM audit_log \
@@ -436,8 +722,21 @@ mod tests {
         s.parse().expect("test date is well formed")
     }
 
-    async fn repo() -> SqliteRepository {
-        SqliteRepository::new(Db::in_memory().await.expect("in-memory database opens"))
+    /// A project repository on its own database.
+    async fn repo() -> SqliteProjectRepository {
+        SqliteProjectRepository::new(Db::in_memory().await.expect("in-memory database opens"))
+    }
+
+    /// Projects, employees and the audit log over one shared database, for the
+    /// tests that need to see two of them agree.
+    async fn linked() -> (SqliteProjectRepository, SqliteEmployeeRepository, SqliteActivityRepository)
+    {
+        let db = Db::in_memory().await.expect("in-memory database opens");
+        (
+            SqliteProjectRepository::new(db.clone()),
+            SqliteEmployeeRepository::new(db.clone()),
+            SqliteActivityRepository::new(db),
+        )
     }
 
     fn valid(draft: ProjectDraft) -> ValidProject {
@@ -453,7 +752,7 @@ mod tests {
         draft
     }
 
-    async fn seed_portfolio(repo: &SqliteRepository) -> Vec<Project> {
+    async fn seed_portfolio(repo: &SqliteProjectRepository) -> Vec<Project> {
         let mut port = ProjectDraft::new("Toamasina Port Logistics", date("2025-09-15"));
         port.client = Some("SMMC".into());
         port.location = Some("Toamasina".into());
@@ -669,12 +968,12 @@ mod tests {
 
         #[tokio::test]
         async fn a_failed_edit_leaves_nothing_behind() {
-            let repo = repo().await;
-            let before = repo.recent_activity(10).await.expect("query runs").len();
+            let (repo, _, log) = linked().await;
+            let before = log.recent_activity(10).await.expect("query runs").len();
 
             let _ = repo.update(&ProjectId::from("ghost"), valid(solar_farm())).await;
 
-            let after = repo.recent_activity(10).await.expect("query runs").len();
+            let after = log.recent_activity(10).await.expect("query runs").len();
             assert_eq!(before, after, "a rolled-back edit must not leave an audit row");
         }
     }
@@ -863,7 +1162,7 @@ mod tests {
             seed_portfolio(&repo).await;
 
             let stats = repo.portfolio_stats().await.expect("query runs");
-            assert_eq!(stats, PortfolioStats { total: 4, active: 2, paused: 1, closed: 1 });
+            assert_eq!(stats, PortfolioStats { total: 4, active: 2, paused: 1, closed: 1, people: 0 });
         }
 
         #[tokio::test]
@@ -913,7 +1212,7 @@ mod tests {
 
         #[tokio::test]
         async fn every_change_to_a_project_is_logged_in_order() {
-            let repo = repo().await;
+            let (repo, _, log) = linked().await;
             let created = repo.create(valid(solar_farm())).await.expect("stored");
 
             let mut edit = solar_farm();
@@ -922,7 +1221,7 @@ mod tests {
             repo.delete(&created.id).await.expect("delete runs");
 
             let history =
-                repo.history("project", created.id.as_str()).await.expect("query runs");
+                log.history("project", created.id.as_str()).await.expect("query runs");
             let actions: Vec<AuditAction> = history.iter().map(|e| e.action).collect();
             assert_eq!(
                 actions,
@@ -932,11 +1231,11 @@ mod tests {
 
         #[tokio::test]
         async fn a_deleted_project_is_still_recoverable_from_its_audit_snapshot() {
-            let repo = repo().await;
+            let (repo, _, log) = linked().await;
             let created = repo.create(valid(solar_farm())).await.expect("stored");
             repo.delete(&created.id).await.expect("delete runs");
 
-            let history = repo.history("project", created.id.as_str()).await.expect("query runs");
+            let history = log.history("project", created.id.as_str()).await.expect("query runs");
             let deletion = history.last().expect("the delete is logged");
             let detail = deletion.detail.as_deref().expect("a delete snapshots the row");
             let recovered: Project =
@@ -947,21 +1246,21 @@ mod tests {
 
         #[tokio::test]
         async fn recent_activity_is_newest_first_and_respects_its_limit() {
-            let repo = repo().await;
+            let (repo, _, log) = linked().await;
             seed_portfolio(&repo).await;
 
-            let recent = repo.recent_activity(2).await.expect("query runs");
+            let recent = log.recent_activity(2).await.expect("query runs");
             assert_eq!(recent.len(), 2);
             assert!(recent[0].id > recent[1].id);
 
-            let all = repo.recent_activity(50).await.expect("query runs");
+            let all = log.recent_activity(50).await.expect("query runs");
             assert_eq!(all.len(), 4, "one create per seeded project");
             assert!(all.iter().all(|e| e.action == AuditAction::Create));
         }
 
         #[tokio::test]
         async fn holiday_changes_are_logged_against_the_holiday() {
-            let repo = repo().await;
+            let (repo, _, log) = linked().await;
             let project = repo.create(valid(solar_farm())).await.expect("stored");
             let holiday = repo
                 .add_holiday(
@@ -974,12 +1273,388 @@ mod tests {
                 .expect("holiday is stored");
             repo.remove_holiday(&project.id, &holiday.id).await.expect("removal runs");
 
-            let history = repo
+            let history = log
                 .history("project_holiday", holiday.id.as_str())
                 .await
                 .expect("query runs");
             let actions: Vec<AuditAction> = history.iter().map(|e| e.action).collect();
             assert_eq!(actions, [AuditAction::Create, AuditAction::Delete]);
+        }
+    }
+
+    mod employees {
+        use super::*;
+
+        use crate::domain::employee::EmployeeDraft;
+
+        /// The mockup's first employee, on a freshly created project.
+        async fn rakoto() -> EmployeeDraft {
+            let mut draft = EmployeeDraft::new(
+                "Rakoto",
+                "Randrianasolo",
+                "Site supervisor",
+                date("2026-02-01"),
+            );
+            draft.email = Some("rakoto.randrianasolo@tymio.mg".into());
+            draft.phone = Some("+261 34 12 887 01".into());
+            draft.cin = Some("201021045".into());
+            draft.birth_date = Some(date("1988-04-12"));
+            draft
+        }
+
+        fn ok(draft: EmployeeDraft) -> ValidEmployee {
+            draft.validate().expect("test draft is valid")
+        }
+
+        async fn on_a_project() -> (SqliteProjectRepository, SqliteEmployeeRepository, SqliteActivityRepository, Project)
+        {
+            let (projects, employees, log) = linked().await;
+            let project = projects.create(valid(solar_farm())).await.expect("stored");
+            (projects, employees, log, project)
+        }
+
+        #[tokio::test]
+        async fn a_hired_employee_reads_back_identically() {
+            let (_, employees, _, project) = on_a_project().await;
+            let hired = employees
+                .create(&project.id, ok(rakoto().await))
+                .await
+                .expect("hired");
+
+            let fetched =
+                employees.get(&hired.id).await.expect("query runs").expect("it is there");
+            assert_eq!(fetched, hired);
+            assert_eq!(fetched.project_id, project.id);
+            assert_eq!(fetched.full_name(), "Rakoto Randrianasolo");
+            assert_eq!(fetched.role, "Site supervisor");
+            assert_eq!(fetched.cin.as_deref(), Some("201021045"));
+            assert_eq!(fetched.birth_date, Some(date("1988-04-12")));
+        }
+
+        #[tokio::test]
+        async fn an_employee_with_nothing_optional_recorded_round_trips_too() {
+            let (_, employees, _, project) = on_a_project().await;
+            let hired = employees
+                .create(
+                    &project.id,
+                    ok(EmployeeDraft::new("Hery", "Rabemananjara", "Crane operator", date("2026-04-01"))),
+                )
+                .await
+                .expect("hired");
+
+            let fetched =
+                employees.get(&hired.id).await.expect("query runs").expect("it is there");
+            assert_eq!(fetched.email, None);
+            assert_eq!(fetched.cin, None);
+            assert_eq!(fetched.birth_date, None);
+            assert_eq!(fetched.bank_account, None);
+        }
+
+        #[tokio::test]
+        async fn nobody_can_be_hired_onto_a_project_that_does_not_exist() {
+            let (_, employees, _) = linked().await;
+            let result = employees.create(&ProjectId::from("ghost"), ok(rakoto().await)).await;
+
+            assert!(matches!(result, Err(AppError::NotFound { entity: "project", .. })));
+        }
+
+        #[tokio::test]
+        async fn an_unknown_id_is_none_but_requiring_it_is_an_error() {
+            let (_, employees, _) = linked().await;
+            let missing = EmployeeId::from("no-such-employee");
+
+            assert_eq!(employees.get(&missing).await.expect("query runs"), None);
+            assert!(matches!(
+                employees.require(&missing).await,
+                Err(AppError::NotFound { entity: "employee", .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn the_list_is_ordered_by_last_name_then_first() {
+            let (_, employees, _, project) = on_a_project().await;
+            for (first, last) in [
+                ("Naivo", "Razafimahatratra"),
+                ("Fara", "Rasoanaivo"),
+                ("Soa", "Rakotoarisoa"),
+                ("Ando", "Rasoanaivo"),
+            ] {
+                employees
+                    .create(
+                        &project.id,
+                        ok(EmployeeDraft::new(first, last, "Operative", date("2026-03-02"))),
+                    )
+                    .await
+                    .expect("hired");
+            }
+
+            let listed = employees.list(&EmployeeFilter::default()).await.expect("query runs");
+            let names: Vec<String> = listed.iter().map(|e| e.full_name()).collect();
+            assert_eq!(
+                names,
+                [
+                    "Soa Rakotoarisoa",
+                    "Ando Rasoanaivo",
+                    "Fara Rasoanaivo",
+                    "Naivo Razafimahatratra",
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn the_list_narrows_to_one_project() {
+            let (projects, employees, _, first) = on_a_project().await;
+            let second = projects
+                .create(valid(ProjectDraft::new("Toamasina Port Logistics", date("2025-09-15"))))
+                .await
+                .expect("stored");
+
+            employees.create(&first.id, ok(rakoto().await)).await.expect("hired");
+            employees
+                .create(
+                    &second.id,
+                    ok(EmployeeDraft::new("Soa", "Rakotoarisoa", "Warehouse lead", date("2025-10-01"))),
+                )
+                .await
+                .expect("hired");
+
+            assert_eq!(
+                employees.list(&EmployeeFilter::in_project(&first.id)).await.expect("query runs").len(),
+                1
+            );
+            // No filter is the "People on payroll" count: everyone, everywhere.
+            assert_eq!(employees.list(&EmployeeFilter::default()).await.expect("query runs").len(), 2);
+        }
+
+        #[tokio::test]
+        async fn the_search_box_reaches_role_email_and_cin() {
+            let (_, employees, _, project) = on_a_project().await;
+            employees.create(&project.id, ok(rakoto().await)).await.expect("hired");
+
+            for query in ["randrianasolo", "SITE SUPERVISOR", "tymio.mg", "201021045"] {
+                assert_eq!(
+                    employees.list(&EmployeeFilter::search(query)).await.expect("query runs").len(),
+                    1,
+                    "expected {query:?} to match"
+                );
+            }
+            assert!(employees
+                .list(&EmployeeFilter::search("electrician"))
+                .await
+                .expect("query runs")
+                .is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_edit_keeps_the_employee_on_their_project() {
+            let (_, employees, _, project) = on_a_project().await;
+            let hired = employees.create(&project.id, ok(rakoto().await)).await.expect("hired");
+
+            let mut promotion = rakoto().await;
+            promotion.role = "Project manager".into();
+            let updated =
+                employees.update(&hired.id, ok(promotion)).await.expect("update runs");
+
+            assert_eq!(updated.id, hired.id);
+            assert_eq!(updated.project_id, project.id);
+            assert_eq!(updated.created_at, hired.created_at);
+            assert!(updated.updated_at >= hired.updated_at);
+            assert_eq!(updated.role, "Project manager");
+
+            let refetched =
+                employees.get(&hired.id).await.expect("query runs").expect("still there");
+            assert_eq!(refetched, updated);
+        }
+
+        #[tokio::test]
+        async fn editing_someone_who_is_gone_is_an_error() {
+            let (_, employees, _) = linked().await;
+            let result = employees.update(&EmployeeId::from("ghost"), ok(rakoto().await)).await;
+
+            assert!(matches!(result, Err(AppError::NotFound { entity: "employee", .. })));
+        }
+
+        #[tokio::test]
+        async fn one_cin_belongs_to_one_person() {
+            let (_, employees, _, project) = on_a_project().await;
+            employees.create(&project.id, ok(rakoto().await)).await.expect("hired");
+
+            let mut twin = EmployeeDraft::new("Fara", "Rasoanaivo", "HSE officer", date("2026-02-15"));
+            // The same number written with spaces is the same number.
+            twin.cin = Some("201 021 045".into());
+
+            match employees.create(&project.id, ok(twin)).await {
+                Err(AppError::Conflict(message)) => assert!(message.contains("201021045")),
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_cin_clash_is_caught_on_edit_as_well_as_on_hire() {
+            let (_, employees, _, project) = on_a_project().await;
+            employees.create(&project.id, ok(rakoto().await)).await.expect("hired");
+
+            let second = employees
+                .create(
+                    &project.id,
+                    ok(EmployeeDraft::new("Fara", "Rasoanaivo", "HSE officer", date("2026-02-15"))),
+                )
+                .await
+                .expect("hired without a CIN");
+
+            let mut clash = EmployeeDraft::new("Fara", "Rasoanaivo", "HSE officer", date("2026-02-15"));
+            clash.cin = Some("201021045".into());
+            assert!(matches!(
+                employees.update(&second.id, ok(clash)).await,
+                Err(AppError::Conflict(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn any_number_of_employees_may_have_no_cin_recorded() {
+            let (_, employees, _, project) = on_a_project().await;
+            for first in ["Lalao", "Nivo", "Vola"] {
+                employees
+                    .create(
+                        &project.id,
+                        ok(EmployeeDraft::new(first, "Ravelojaona", "Operative", date("2026-03-02"))),
+                    )
+                    .await
+                    .expect("a missing CIN is not a clash");
+            }
+
+            assert_eq!(employees.headcount(&project.id).await.expect("query runs"), 3);
+        }
+
+        #[tokio::test]
+        async fn deleting_returns_who_was_removed() {
+            let (_, employees, _, project) = on_a_project().await;
+            let hired = employees.create(&project.id, ok(rakoto().await)).await.expect("hired");
+
+            let removed = employees.delete(&hired.id).await.expect("delete runs");
+            assert_eq!(removed, hired);
+            assert_eq!(employees.get(&hired.id).await.expect("query runs"), None);
+            assert_eq!(employees.headcount(&project.id).await.expect("query runs"), 0);
+        }
+
+        #[tokio::test]
+        async fn deleting_someone_who_is_gone_is_an_error() {
+            let (_, employees, _) = linked().await;
+            assert!(matches!(
+                employees.delete(&EmployeeId::from("ghost")).await,
+                Err(AppError::NotFound { entity: "employee", .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn deleting_a_project_takes_its_people_with_it_and_says_so() {
+            let (projects, employees, log, project) = on_a_project().await;
+            let hired = employees.create(&project.id, ok(rakoto().await)).await.expect("hired");
+
+            projects.delete(&project.id).await.expect("delete runs");
+
+            assert_eq!(employees.get(&hired.id).await.expect("query runs"), None);
+
+            // The cascade is silent in SQL; the audit log must not be.
+            let history = log.history("employee", hired.id.as_str()).await.expect("query runs");
+            let actions: Vec<AuditAction> = history.iter().map(|e| e.action).collect();
+            assert_eq!(actions, [AuditAction::Create, AuditAction::Delete]);
+
+            let snapshot = history.last().expect("the delete is logged").detail.as_deref();
+            let recovered: Employee =
+                serde_json::from_str(snapshot.expect("a delete snapshots the row"))
+                    .expect("the snapshot is the employee itself");
+            assert_eq!(recovered, hired);
+        }
+
+        #[tokio::test]
+        async fn every_change_to_an_employee_is_logged_in_order() {
+            let (_, employees, log, project) = on_a_project().await;
+            let hired = employees.create(&project.id, ok(rakoto().await)).await.expect("hired");
+
+            let mut promotion = rakoto().await;
+            promotion.role = "Project manager".into();
+            employees.update(&hired.id, ok(promotion)).await.expect("update runs");
+            employees.delete(&hired.id).await.expect("delete runs");
+
+            let history = log.history("employee", hired.id.as_str()).await.expect("query runs");
+            let actions: Vec<AuditAction> = history.iter().map(|e| e.action).collect();
+            assert_eq!(actions, [AuditAction::Create, AuditAction::Update, AuditAction::Delete]);
+        }
+
+        #[tokio::test]
+        async fn a_rejected_hire_leaves_no_audit_row() {
+            let (_, employees, log, project) = on_a_project().await;
+            employees.create(&project.id, ok(rakoto().await)).await.expect("hired");
+            let before = log.recent_activity(50).await.expect("query runs").len();
+
+            let mut twin = EmployeeDraft::new("Fara", "Rasoanaivo", "HSE officer", date("2026-02-15"));
+            twin.cin = Some("201021045".into());
+            let _ = employees.create(&project.id, ok(twin)).await;
+
+            assert_eq!(log.recent_activity(50).await.expect("query runs").len(), before);
+        }
+
+        #[tokio::test]
+        async fn employee_stats_come_from_the_stored_dates() {
+            let (_, employees, _, project) = on_a_project().await;
+            let hired = employees.create(&project.id, ok(rakoto().await)).await.expect("hired");
+
+            let stats = employees.stats(&hired.id, date("2026-09-15")).await.expect("query runs");
+            assert_eq!(stats.employee_id, hired.id);
+            assert_eq!(stats.project_id, project.id);
+            assert_eq!(stats.age, Some(38));
+            assert_eq!(stats.months_of_service, 7);
+            assert_eq!(stats.months_worked_this_year, 8);
+        }
+
+        #[tokio::test]
+        async fn stats_for_someone_who_is_gone_are_an_error() {
+            let (_, employees, _) = linked().await;
+            assert!(matches!(
+                employees.stats(&EmployeeId::from("ghost"), date("2026-09-15")).await,
+                Err(AppError::NotFound { entity: "employee", .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn headcount_reaches_the_project_card_and_the_portfolio_kpi() {
+            let (projects, employees, _, first) = on_a_project().await;
+            let second = projects
+                .create(valid(ProjectDraft::new("Toamasina Port Logistics", date("2025-09-15"))))
+                .await
+                .expect("stored");
+
+            for first_name in ["Rakoto", "Fara", "Naivo"] {
+                employees
+                    .create(
+                        &first.id,
+                        ok(EmployeeDraft::new(first_name, "Rasoanaivo", "Operative", date("2026-03-02"))),
+                    )
+                    .await
+                    .expect("hired");
+            }
+            employees
+                .create(
+                    &second.id,
+                    ok(EmployeeDraft::new("Soa", "Rakotoarisoa", "Warehouse lead", date("2025-10-01"))),
+                )
+                .await
+                .expect("hired");
+
+            let stats = projects.stats(&first.id, date("2026-09-15")).await.expect("query runs");
+            assert_eq!(stats.headcount, 3, "the project card counts only its own people");
+
+            let portfolio = projects.portfolio_stats().await.expect("query runs");
+            assert_eq!(portfolio.people, 4, "the KPI counts everyone, everywhere");
+            assert_eq!(portfolio.total, 2);
+        }
+
+        #[tokio::test]
+        async fn an_empty_project_has_a_headcount_of_zero() {
+            let (projects, _, _, project) = on_a_project().await;
+            let stats = projects.stats(&project.id, date("2026-09-15")).await.expect("query runs");
+            assert_eq!(stats.headcount, 0);
         }
     }
 }

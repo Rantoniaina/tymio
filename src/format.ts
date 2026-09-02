@@ -3,7 +3,7 @@
  * dd/mm/yyyy, thousands separated by spaces.
  */
 
-import type { IsoDate, IsoInstant, WorkCalendar } from "./types";
+import type { IsoDate, IsoInstant, WorkCalendar, YearMonth } from "./types";
 
 /** The em dash the mockup uses wherever a value is absent. */
 export const ABSENT = "—";
@@ -78,4 +78,92 @@ export function today(): IsoDate {
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+const MONTH_NAMES = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+/** `{ year: 2026, month: 9 }` → `September 2026`. */
+export function formatMonth(month: YearMonth): string {
+  return `${MONTH_NAMES[month.month - 1]} ${month.year}`;
+}
+
+/** The `YYYY-MM` form, used as a select value. */
+export function monthKey(month: YearMonth): string {
+  return `${month.year}-${String(month.month).padStart(2, "0")}`;
+}
+
+export function parseMonthKey(key: string): YearMonth {
+  const [year, month] = key.split("-");
+  return { year: Number(year), month: Number(month) };
+}
+
+export function thisMonth(): YearMonth {
+  const now = new Date();
+  return { year: now.getFullYear(), month: now.getMonth() + 1 };
+}
+
+/** The last `count` months, most recent first. */
+export function recentMonths(count = 12): YearMonth[] {
+  const now = new Date();
+  return Array.from({ length: count }, (_, back) => {
+    const at = new Date(now.getFullYear(), now.getMonth() - back, 1);
+    return { year: at.getFullYear(), month: at.getMonth() + 1 };
+  });
+}
+
+/**
+ * The date to ask the backend about for a chosen period: the end of that
+ * month, except for the current one, where the future has not happened yet.
+ */
+export function asOfFor(month: YearMonth): IsoDate {
+  const now = thisMonth();
+  if (month.year === now.year && month.month === now.month) return today();
+  const last = new Date(month.year, month.month, 0);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${last.getFullYear()}-${pad(last.getMonth() + 1)}-${pad(last.getDate())}`;
+}
+
+/** `18` → `18 years`, with the singular handled. */
+export function pluralise(count: number, unit: string): string {
+  return `${count} ${unit}${count === 1 ? "" : "s"}`;
+}
+
+/** Whole months as the employee file writes them: `1 year 7 months`. */
+export function formatService(months: number): string {
+  if (months < 12) return pluralise(months, "month");
+  const years = Math.floor(months / 12);
+  const rest = months % 12;
+  return rest === 0
+    ? pluralise(years, "year")
+    : `${pluralise(years, "year")} ${pluralise(rest, "month")}`;
+}
+
+/**
+ * The mockup's avatar palette, picked from a stable hash so one person keeps
+ * one colour.
+ */
+const AVATAR_COLOURS = [
+  "oklch(0.52 0.10 175)",
+  "oklch(0.52 0.10 60)",
+  "oklch(0.52 0.10 320)",
+  "oklch(0.52 0.10 250)",
+];
+
+export function avatarColour(seed: string): string {
+  let hash = 0;
+  for (const character of seed) hash = (hash * 31 + character.codePointAt(0)!) >>> 0;
+  return AVATAR_COLOURS[hash % AVATAR_COLOURS.length];
 }

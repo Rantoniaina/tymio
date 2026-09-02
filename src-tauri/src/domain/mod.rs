@@ -1,6 +1,7 @@
 //! Domain types and rules. Nothing in here knows about SQL, Tauri or the UI.
 
 pub mod calendar;
+pub mod employee;
 pub mod project;
 
 use std::fmt;

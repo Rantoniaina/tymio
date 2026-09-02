@@ -4,13 +4,10 @@ pub mod domain;
 pub mod error;
 pub mod repo;
 
-use std::sync::Arc;
-
 use tauri::Manager;
 
 use crate::commands::AppState;
 use crate::db::Db;
-use crate::repo::sqlite::SqliteRepository;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -23,7 +20,7 @@ pub fn run() {
             // upgrades and reinstalls.
             let data_dir = app.path().app_data_dir()?;
             let db = tauri::async_runtime::block_on(Db::open_in(&data_dir))?;
-            app.manage(AppState::new(Arc::new(SqliteRepository::new(db))));
+            app.manage(AppState::new(db));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -38,6 +35,12 @@ pub fn run() {
             commands::add_project_holiday,
             commands::remove_project_holiday,
             commands::recent_activity,
+            commands::create_employee,
+            commands::get_employee,
+            commands::list_employees,
+            commands::update_employee,
+            commands::delete_employee,
+            commands::employee_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

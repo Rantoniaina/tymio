@@ -394,16 +394,18 @@ impl DurationProgress {
     }
 }
 
-/// The numbers on one project's overview, as far as projects alone can tell.
+/// The numbers on one project's overview.
 ///
-/// Headcount, monthly cost and pending-leave counts belong here too, but they
-/// read tables that do not exist yet; they join when employees, leave and
-/// payroll land.
+/// Monthly cost and the pending-leave count belong here too, but they read
+/// tables that do not exist yet; they join when leave and payroll land.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectStats {
     pub project_id: ProjectId,
     pub status: ProjectStatus,
+    /// People on this project. Counted by the repository, which is the only
+    /// layer that can see both tables.
+    pub headcount: u32,
     /// The date the stats were taken as of — passed in, never `today()` deep
     /// inside, so the numbers are reproducible in a test.
     pub as_of: NaiveDate,
@@ -415,11 +417,17 @@ pub struct ProjectStats {
 }
 
 impl ProjectStats {
-    pub fn compute(project: &Project, holidays: &HolidaySet, as_of: NaiveDate) -> Self {
+    pub fn compute(
+        project: &Project,
+        holidays: &HolidaySet,
+        headcount: u32,
+        as_of: NaiveDate,
+    ) -> Self {
         let month = YearMonth::of(as_of);
         ProjectStats {
             project_id: project.id.clone(),
             status: project.status,
+            headcount,
             as_of,
             month,
             duration: project.duration(as_of),
@@ -437,6 +445,9 @@ pub struct PortfolioStats {
     pub active: u32,
     pub paused: u32,
     pub closed: u32,
+    /// Everyone on the books, across every project — the mockup's "People on
+    /// payroll" KPI.
+    pub people: u32,
 }
 
 impl PortfolioStats {
@@ -741,9 +752,10 @@ mod tests {
             let project = stored(draft);
 
             let holidays: HolidaySet = ["2026-09-07"].iter().map(|s| date(s)).collect();
-            let stats = ProjectStats::compute(&project, &holidays, date("2026-09-15"));
+            let stats = ProjectStats::compute(&project, &holidays, 6, date("2026-09-15"));
 
             assert_eq!(stats.month, YearMonth::new(2026, 9).expect("september"));
+            assert_eq!(stats.headcount, 6);
             assert_eq!(stats.holiday_count, 1);
             // September 2026 has 26 Mon–Sat days; one is a holiday.
             assert_eq!(stats.working_days_this_month, 25);
@@ -753,7 +765,7 @@ mod tests {
 
         #[test]
         fn portfolio_counts_are_addressable_by_status() {
-            let stats = PortfolioStats { total: 4, active: 2, paused: 1, closed: 1 };
+            let stats = PortfolioStats { total: 4, active: 2, paused: 1, closed: 1, people: 12 };
             assert_eq!(stats.count(ProjectStatus::Active), 2);
             assert_eq!(stats.count(ProjectStatus::Paused), 1);
             assert_eq!(stats.count(ProjectStatus::Closed), 1);
