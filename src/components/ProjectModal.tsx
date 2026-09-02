@@ -131,38 +131,52 @@ export function ProjectModal({
         </div>
 
         <div className="modal__body">
-          <label className="field field--wide">
-            <span className="field__label">Project name</span>
+          {/* Labels are associated by `htmlFor` and hints by
+              `aria-describedby`: nesting a hint inside the `<label>` would
+              fold it into the input's accessible name. */}
+          <div className="field field--wide">
+            <label className="field__label" htmlFor="project-name">
+              Project name
+            </label>
             <input
               ref={firstField}
+              id="project-name"
               className={`field__input${fieldError("name") ? " field__input--invalid" : ""}`}
               name="name"
               value={draft.name}
               placeholder="e.g. Ambatolampy Solar Farm"
               aria-invalid={Boolean(fieldError("name"))}
+              aria-describedby={fieldError("name") ? "project-name-error" : undefined}
               onChange={(e) => set("name", e.target.value)}
             />
             {fieldError("name") && (
-              <span className="field__error" data-testid="error-name">
+              <span id="project-name-error" className="field__error" data-testid="error-name">
                 {fieldError("name")}
               </span>
             )}
-          </label>
+          </div>
 
-          <label className="field">
-            <span className="field__label">Client</span>
+          <div className="field">
+            <label className="field__label" htmlFor="project-client">
+              Client
+            </label>
             <input
+              id="project-client"
               className={`field__input${fieldError("client") ? " field__input--invalid" : ""}`}
               name="client"
               value={draft.client ?? ""}
+              aria-invalid={Boolean(fieldError("client"))}
               onChange={(e) => set("client", e.target.value)}
             />
             {fieldError("client") && <span className="field__error">{fieldError("client")}</span>}
-          </label>
+          </div>
 
-          <label className="field">
-            <span className="field__label">Location</span>
+          <div className="field">
+            <label className="field__label" htmlFor="project-location">
+              Location
+            </label>
             <input
+              id="project-location"
               className="field__input"
               name="location"
               value={draft.location ?? ""}
@@ -171,11 +185,14 @@ export function ProjectModal({
             {fieldError("location") && (
               <span className="field__error">{fieldError("location")}</span>
             )}
-          </label>
+          </div>
 
-          <label className="field">
-            <span className="field__label">Status</span>
+          <div className="field">
+            <label className="field__label" htmlFor="project-status">
+              Status
+            </label>
             <select
+              id="project-status"
               className="field__input"
               name="status"
               value={draft.status}
@@ -187,37 +204,46 @@ export function ProjectModal({
                 </option>
               ))}
             </select>
-          </label>
+          </div>
 
-          <label className="field">
-            <span className="field__label">Start date</span>
+          <div className="field">
+            <label className="field__label" htmlFor="project-start">
+              Start date
+            </label>
             <input
+              id="project-start"
               className="field__input"
               type="date"
               name="start"
               value={draft.start}
               onChange={(e) => set("start", e.target.value)}
             />
-          </label>
+          </div>
 
-          <label className="field">
-            <span className="field__label">End date</span>
+          <div className="field">
+            <label className="field__label" htmlFor="project-end">
+              End date
+            </label>
             <input
+              id="project-end"
               className={`field__input${fieldError("end") ? " field__input--invalid" : ""}`}
               type="date"
               name="end"
               value={draft.end ?? ""}
               aria-invalid={Boolean(fieldError("end"))}
+              aria-describedby="project-end-hint"
               onChange={(e) => set("end", e.target.value || null)}
             />
             {fieldError("end") ? (
-              <span className="field__error" data-testid="error-end">
+              <span id="project-end-hint" className="field__error" data-testid="error-end">
                 {fieldError("end")}
               </span>
             ) : (
-              <span className="field__help">Leave empty for an open-ended project</span>
+              <span id="project-end-hint" className="field__help">
+                Leave empty for an open-ended project
+              </span>
             )}
-          </label>
+          </div>
 
           {/* Not in the mockup. The work calendar is a project field by the
               design spec, and payroll derives worked days from it, so it has

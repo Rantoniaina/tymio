@@ -1,41 +1,7 @@
 import { expect, firstMondayOfThisMonth, monthsFromNow, test } from "./fixtures";
-import type { Page } from "@playwright/test";
+import { createProject, openProjectEditor, projectCard as card } from "./helpers";
 
-interface NewProject {
-  name: string;
-  client?: string;
-  location?: string;
-  status?: "active" | "paused" | "closed";
-  start?: string;
-  end?: string;
-}
-
-async function createProject(page: Page, project: NewProject) {
-  await page.getByRole("button", { name: "New project" }).click();
-  const modal = page.getByTestId("project-modal");
-  await expect(modal).toBeVisible();
-
-  await modal.getByLabel("Project name").fill(project.name);
-  if (project.client) await modal.getByLabel("Client").fill(project.client);
-  if (project.location) await modal.getByLabel("Location").fill(project.location);
-  if (project.status) await modal.getByLabel("Status").selectOption(project.status);
-  if (project.start) await modal.getByLabel("Start date").fill(project.start);
-  if (project.end) await modal.getByLabel("End date").fill(project.end);
-
-  await modal.getByRole("button", { name: "Create project" }).click();
-  await expect(modal).toBeHidden();
-}
-
-function card(page: Page, name: string) {
-  return page.locator(`[data-testid="project-card"][data-project-name="${name}"]`);
-}
-
-async function openEditor(page: Page, name: string) {
-  await card(page, name).getByRole("button", { name: "Edit" }).click();
-  const modal = page.getByTestId("project-modal");
-  await expect(modal).toBeVisible();
-  return modal;
-}
+const openEditor = openProjectEditor;
 
 test("an empty database offers a first project rather than an empty grid", async ({ app }) => {
   await expect(app.getByTestId("empty-state")).toBeVisible();
